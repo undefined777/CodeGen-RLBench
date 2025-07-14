@@ -8,12 +8,12 @@ import torch.nn.functional as F
 import collections
 import numpy as np
 from tqdm import tqdm
-from parser import (tree_to_token_index,
+from code_parser import (tree_to_token_index,
                    tree_to_token_nodes,
                    index_to_code_token,
                    tree_to_variable_index, 
                    detokenize_code)
-from parser import DFG_python,DFG_java,DFG_ruby,DFG_go,DFG_php,DFG_javascript,DFG_csharp
+from code_parser import DFG_python,DFG_java,DFG_ruby,DFG_go,DFG_php,DFG_javascript,DFG_csharp
 from tree_sitter import Language, Parser
 import pickle
 
@@ -27,7 +27,7 @@ dfg_function={
     'cpp':DFG_csharp,}
 parsers={}        
 for lang in dfg_function:
-    LANGUAGE = Language('parser/my-languages.so', lang)
+    LANGUAGE = Language('code_parser/my-languages.so', lang)
     parser = Parser()
     parser.set_language(LANGUAGE) 
     parser = [parser,dfg_function[lang]]    

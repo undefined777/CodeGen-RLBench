@@ -7,7 +7,7 @@
 
 from itertools import chain
 
-from tree_sitter import Language
+from tree_sitter import Language  # 重新导入Language
 
 AVAILABLE_LANGS = [
     "java",
@@ -132,47 +132,37 @@ def get_tree_sitter_language(lang: str) -> Language:
     try:
         if lang == "java":
             import tree_sitter_java
-
-            return Language(tree_sitter_java.language())
+            return Language(tree_sitter_java.language(), "java")
         elif lang == "javascript":
             import tree_sitter_javascript
-
-            return Language(tree_sitter_javascript.language())
+            return Language(tree_sitter_javascript.language(), "javascript")
         elif lang == "c_sharp":
             import tree_sitter_c_sharp
-
-            return Language(tree_sitter_c_sharp.language())
+            return Language(tree_sitter_c_sharp.language(), "c_sharp")
         elif lang == "php":
             import tree_sitter_php
-
             try:
-                return Language(tree_sitter_php.language())  # type: ignore[attr-defined]
+                return Language(tree_sitter_php.language(), "php")
             except AttributeError:
-                return Language(tree_sitter_php.language_php())
+                return Language(tree_sitter_php.language_php(), "php")
         elif lang == "c":
             import tree_sitter_c
-
-            return Language(tree_sitter_c.language())
+            return Language(tree_sitter_c.language(), "c")
         elif lang == "cpp":
             import tree_sitter_cpp
-
-            return Language(tree_sitter_cpp.language())
+            return Language(tree_sitter_cpp.language(), "cpp")
         elif lang == "python":
             import tree_sitter_python
-
-            return Language(tree_sitter_python.language())
+            return Language(tree_sitter_python.language(), "python")
         elif lang == "go":
             import tree_sitter_go
-
-            return Language(tree_sitter_go.language())
+            return Language(tree_sitter_go.language(), "go")
         elif lang == "ruby":
             import tree_sitter_ruby
-
-            return Language(tree_sitter_ruby.language())
+            return Language(tree_sitter_ruby.language(), "ruby")
         elif lang == "rust":
             import tree_sitter_rust
-
-            return Language(tree_sitter_rust.language())
+            return Language(tree_sitter_rust.language(), "rust")
         else:
             assert False, "Not reachable"
     except ImportError:

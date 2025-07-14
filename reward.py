@@ -5,9 +5,10 @@ import torch
 from code_prepro.lang_processors import *
 from compiler.terminal_compiler import TerminalCompiler
 import sys
-from parser import DFG_python,DFG_java,DFG_ruby,DFG_go,DFG_php,DFG_javascript,DFG_csharp
+from code_parser import DFG_python,DFG_java,DFG_ruby,DFG_go,DFG_php,DFG_javascript,DFG_csharp
+from termcolor import colored
 sys.path.insert(0, '/home/grads/parshinshojaee/trl_code/trl_code/rl_code_repo/CodeBLEU/')
-from calc_code_bleu import calc_code_bleu
+from codebleu.calc_code_bleu import calc_code_bleu
 
 
 
@@ -37,7 +38,7 @@ dfg_function={
     'cpp':DFG_csharp,}
 parsers={}        
 for lang in dfg_function:
-    LANGUAGE = Language('parser/my-languages.so', lang)
+    LANGUAGE = Language('code_parser/my-languages.so', lang)
     parser = Parser()
     parser.set_language(LANGUAGE)   
     parsers[lang]= parser
@@ -112,11 +113,11 @@ def get_reward(lang, code_ids=None,code_ref_ids=None,gold_ids=None, tokenizer=No
     num_nodes_ref = [i[1] for i in error_node_counts_ref]
     num_nodes_gold = [i[1] for i in error_node_counts_gold]
     
-    keywords_dir = 'CodeBLEU/keywords/'
+    keywords_dir = 'codebleu/keywords/'
     # ast_match = calc_code_bleu([codes_gold], codes, lang, keywords_dir)[2]
     # dfg_match = calc_code_bleu([codes_gold], codes, lang, keywords_dir)[3]
     
-    rewards = np.zeros_like(code_ids, dtype=np.float)
+    rewards = np.zeros_like(code_ids, dtype=np.float64)
     ast_match_batch = 0
     dfg_match_batch = 0
     compile_batch = 0

@@ -42,7 +42,7 @@ def corpus_dataflow_match(references, candidates, lang, tree_sitter_language=Non
         tree_sitter_language = get_tree_sitter_language(lang)
 
     parser = Parser()
-    parser.language = tree_sitter_language
+    parser.set_language(tree_sitter_language)
     parser = [parser, dfg_function[lang]]
     match_count = 0
     total_count = 0
