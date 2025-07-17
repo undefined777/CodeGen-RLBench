@@ -141,6 +141,8 @@ def get_reward(lang, code_ids=None,code_ref_ids=None,gold_ids=None, tokenizer=No
              for id,eos_pos in zip(gold_ids, eos_positions)] 
         
     codes = [code_detokenizers[lang](code) for code in codes]
+    codes_ref = [code_detokenizers[lang](code) for code in codes_ref]
+    codes_gold = [code_detokenizers[lang](code) for code in codes_gold]
     
     compilation = [lang2compiler[lang].compile_code_string(code) for code in codes]
 

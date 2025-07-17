@@ -130,13 +130,38 @@ class PPOTrainer:
 
 
     def batched_forward_pass(self, source_ids, source_mask, response_ids):
+        """
+        Compute model & ref_model logprobs only over the *response* tokens.
+        We must feed the *concatenated* [source | response] sequence to the model
+        so that response logprobs are conditioned on the source prompt.
+        """
+        # 构造拼接序列
+        bs = source_ids.size(0)
+        device = source_ids.device
+        resp_mask = torch.ones_like(response_ids, dtype=source_mask.dtype, device=device)
+        full_input = torch.cat([source_ids, response_ids], dim=1)          # [B, S+R]
+        full_mask  = torch.cat([source_mask, resp_mask], dim=1)            # [B, S+R]
+
         with torch.no_grad():
-            logits, _, values = self.model(input_ids=source_ids, attention_mask=source_mask, labels=response_ids)
-            ref_logits, _, _ = self.ref_model(input_ids=source_ids, attention_mask=source_mask, labels=response_ids)
-        values = values.detach()
-        logprobs = logprobs_from_logits(logits, response_ids).detach()
-        ref_logprobs = logprobs_from_logits(ref_logits, response_ids).detach()
-        
+            logits, _, values_full = self.model(input_ids=full_input,
+                                               attention_mask=full_mask,
+                                               labels=None)  # 不计算LM loss
+            ref_logits, _, _ = self.ref_model(input_ids=full_input,
+                                              attention_mask=full_mask,
+                                              labels=None)
+
+        # 我们只需要预测 response token 的logprob。
+        # 模型 logits[:, :-1] 对应 full_input[:, 1:]
+        S = source_ids.size(1)
+        # 对第一个response token的预测来自位置 S-1
+        logits_resp = logits[:, S-1:-1, :]     # 长度 = R
+        ref_logits_resp = ref_logits[:, S-1:-1, :]
+
+        logprobs = logprobs_from_logits(logits_resp, response_ids).detach()
+        ref_logprobs = logprobs_from_logits(ref_logits_resp, response_ids).detach()
+
+        # 值函数：取与logprobs对齐的token位置（预测token所在位置，即S-1...S+R-2）
+        values = values_full[:, S-1:-1].detach()
         return logprobs, ref_logprobs, values
 
 
@@ -167,7 +192,7 @@ class PPOTrainer:
         return rewards, non_score_reward, self.kl_ctl.value
 
 
-    def loss(self, old_logprobs, values, rewards, source_ids, source_mask, response_ids,response_ids_ref): ##MODIFIED
+    def loss(self, old_logprobs, values, rewards, source_ids, source_mask, response_ids, response_ids_ref):
         lastgaelam = 0
         advantages_reversed = []
         gen_len = response_ids.size()[1]
@@ -182,8 +207,18 @@ class PPOTrainer:
         advantages = whiten(advantages)
         advantages = advantages.detach()
 
-        logits, _, vpred = self.model(input_ids=source_ids, attention_mask=source_mask, labels=response_ids)
-        logprob = logprobs_from_logits(logits, response_ids)
+        # 与 batched_forward_pass 相同：拼接序列，手动对齐 response
+        device = source_ids.device
+        resp_mask = torch.ones_like(response_ids, dtype=source_mask.dtype, device=device)
+        full_input = torch.cat([source_ids, response_ids], dim=1)
+        full_mask  = torch.cat([source_mask, resp_mask], dim=1)
+        logits, _, vpred_full = self.model(input_ids=full_input,
+                                           attention_mask=full_mask,
+                                           labels=None)
+        S = source_ids.size(1)
+        logits_resp = logits[:, S-1:-1, :]
+        logprob = logprobs_from_logits(logits_resp, response_ids)
+        vpred = vpred_full[:, S-1:-1]
         vpredclipped = clip_by_value(vpred,
                                      values - self.ppo_params["cliprange_value"],
                                      values + self.ppo_params["cliprange_value"])

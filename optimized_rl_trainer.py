@@ -28,6 +28,9 @@ from dataclasses import dataclass
 from tqdm import tqdm
 import json
 
+# 🔧 新增：Tensorboard 支持
+from torch.utils.tensorboard import SummaryWriter
+
 # 项目内部导入
 from code_parser import (DFG_python, DFG_java, DFG_ruby, DFG_go, 
                         DFG_php, DFG_javascript, DFG_csharp)
@@ -135,14 +138,18 @@ def read_qwen_examples(filename: str, args) -> List[Example]:
                 data = json.loads(line)
                 messages = data.get('messages', [])
                 
-                # 查找user和assistant消息
+                # 查找 system / user / assistant 消息
+                system_message = None
                 user_message = None
                 assistant_message = None
                 
                 for message in messages:
-                    if message.get('role') == 'user':
+                    role = message.get('role')
+                    if role == 'system':
+                        system_message = message.get('content', '')
+                    elif role == 'user':
                         user_message = message.get('content', '')
-                    elif message.get('role') == 'assistant':
+                    elif role == 'assistant':
                         assistant_message = message.get('content', '')
                 
                 if not user_message or not assistant_message:
@@ -157,19 +164,17 @@ def read_qwen_examples(filename: str, args) -> List[Example]:
                 if not source_code or not target_code:
                     continue
                 
-                # Example的orig字段保存完整的消息，用于tokenization
-                # source_orig: 完整的user prompt，用于模型输入
-                # target_orig: 完整的assistant回复，用于计算loss
-                examples.append(
-                    Example(
-                        idx=idx,
-                        source=source_code,  # 纯代码，用于显示
-                        target=target_code,  # 纯代码，用于显示  
-                        source_orig=user_message,  # 完整prompt，用于tokenization
-                        target_orig=assistant_message  # 完整回复，用于tokenization
-                    )
+                e = Example(
+                    idx=idx,
+                    source=source_code,
+                    target=target_code,
+                    source_orig=user_message,      # 先存 user；system 单独挂
+                    target_orig=assistant_message
                 )
-                
+                # 动态挂载 system（若无则空串）
+                setattr(e, "system_orig", system_message or "")
+                examples.append(e)
+
             except (json.JSONDecodeError, KeyError, IndexError) as e:
                 print(f"跳过第{idx+1}行，解析错误: {e}")
                 continue
@@ -192,12 +197,19 @@ def convert_qwen_examples_to_features(examples, tokenizer, args, stage=None):
         if hasattr(tokenizer, 'apply_chat_template'):
             # 尝试使用chat template
             try:
-                messages = [
-                    {"role": "user", "content": example.source_orig}
-                ]
+                if hasattr(example, "system_orig") and example.system_orig:
+                    # 使用样本自带 system
+                    messages = [
+                        {"role": "system", "content": example.system_orig},
+                        {"role": "user", "content": example.source_orig},
+                    ]
+                else:
+                    messages = [
+                        {"role": "user", "content": example.source_orig},
+                    ]
                 source_text = tokenizer.apply_chat_template(
                     messages, add_generation_prompt=True, tokenize=False
-                )
+                ) 
             except:
                 # 如果失败，使用原始内容
                 source_text = example.source_orig
@@ -238,84 +250,80 @@ def convert_qwen_examples_to_features(examples, tokenizer, args, stage=None):
 
 def create_reward_wrapper(original_get_reward):
     """
-    创建get_reward的包装器，在调用前提取代码
+    Wrap the original `get_reward()` so that *each* of (policy, ref, gold)
+    is decoded up to **its own** EOS, code-block extracted, re-tokenized,
+    EOS-appended, and padded to a common length *before* reward computation.
+    这样避免将 policy 的 eos 位置误用于 ref/gold（原实现的问题）。
     """
     def get_reward_with_extraction(lang, code_ids=None, code_ref_ids=None, gold_ids=None, tokenizer=None):
-        """
-        调用原始get_reward前，先从Qwen响应中提取代码
-        """
-        # 首先解码为完整响应
-        code_ids_np = np.array(code_ids.cpu())
-        eos_positions = []
-        max_len = code_ids_np.shape[1]
-        
-        for id_seq in code_ids_np:
-            if tokenizer.eos_token_id in id_seq:
-                eos_positions.append((id_seq == tokenizer.eos_token_id).argmax())
-            else:
-                eos_positions.append(max_len)
-        
-        # 解码为文本
-        raw_responses = [
-            tokenizer.decode(id_seq[:eos_pos], skip_special_tokens=True, clean_up_tokenization_spaces=False)
-            for id_seq, eos_pos in zip(code_ids_np, eos_positions)
-        ]
-        raw_responses_ref = [
-            tokenizer.decode(id_seq[:eos_pos], skip_special_tokens=True, clean_up_tokenization_spaces=False)
-            for id_seq, eos_pos in zip(code_ref_ids.cpu().numpy(), eos_positions)
-        ]
-        raw_gold = [
-            tokenizer.decode(id_seq[:eos_pos], skip_special_tokens=True, clean_up_tokenization_spaces=False)
-            for id_seq, eos_pos in zip(gold_ids.cpu().numpy(), eos_positions)
-        ]
-        
-        # 提取代码
-        extracted_codes = [extract_code_from_qwen_response(resp, lang) for resp in raw_responses]
-        extracted_codes_ref = [extract_code_from_qwen_response(resp, lang) for resp in raw_responses_ref]
-        extracted_codes_gold = [extract_code_from_qwen_response(resp, lang) for resp in raw_gold]
-        
-        
-        # 重新编码为token ids
-        extracted_ids = []
-        extracted_ids_ref = []
-        extracted_ids_gold = []
-        
-        # 首先编码所有代码，收集长度信息
-        all_tokens = []
-        for code, code_ref, code_gold in zip(extracted_codes, extracted_codes_ref, extracted_codes_gold):
-            code_tokens = tokenizer.encode(code, add_special_tokens=False)
-            code_ref_tokens = tokenizer.encode(code_ref, add_special_tokens=False)
-            code_gold_tokens = tokenizer.encode(code_gold, add_special_tokens=False)
-            
-            all_tokens.append((code_tokens, code_ref_tokens, code_gold_tokens))
-        
-        # 计算所有代码的最大长度，但不超过原始tensor的长度
-        all_lengths = [len(tokens) for tokens_group in all_tokens for tokens in tokens_group]
-        max_code_len = min(max(all_lengths), max_len) if all_lengths else max_len
-        
-        # 使用统一长度进行填充
-        for code_tokens, code_ref_tokens, code_gold_tokens in all_tokens:
-            # 截断和填充到统一长度
-            code_tokens = code_tokens[:max_code_len] + [tokenizer.pad_token_id] * (max_code_len - len(code_tokens))
-            code_ref_tokens = code_ref_tokens[:max_code_len] + [tokenizer.pad_token_id] * (max_code_len - len(code_ref_tokens))
-            code_gold_tokens = code_gold_tokens[:max_code_len] + [tokenizer.pad_token_id] * (max_code_len - len(code_gold_tokens))
-            
-            extracted_ids.append(code_tokens)
-            extracted_ids_ref.append(code_ref_tokens)
-            extracted_ids_gold.append(code_gold_tokens)
-        
-        # 转换为tensor
-        extracted_tensor = torch.tensor(extracted_ids, device=code_ids.device)
-        extracted_tensor_ref = torch.tensor(extracted_ids_ref, device=code_ids.device)
-        extracted_tensor_gold = torch.tensor(extracted_ids_gold, device=code_ids.device)
-        
-        # 调用原始get_reward函数
+        # ---------- helpers ----------
+        def _decode_rows(t: torch.Tensor):
+            """
+            Return (texts, eos_pos_list, max_seq_len) for given token ids tensor.
+            """
+            arr = t.detach().cpu().numpy()
+            max_len = arr.shape[1]
+            texts, eos_pos_list = [], []
+            eos_id = tokenizer.eos_token_id
+            for row in arr:
+                # find EOS; if none, use max_len
+                eos_pos = int((row == eos_id).argmax()) if eos_id in row else max_len
+                eos_pos_list.append(eos_pos)
+                texts.append(
+                    tokenizer.decode(
+                        row[:eos_pos],
+                        skip_special_tokens=True,
+                        clean_up_tokenization_spaces=False,
+                    )
+                )
+            return texts, eos_pos_list, max_len
+
+        # ---------- decode raw responses ----------
+        raw_responses, eos_resp, max_resp = _decode_rows(code_ids)
+        raw_responses_ref, eos_ref, max_ref = _decode_rows(code_ref_ids)
+        raw_gold, eos_gold, max_gold = _decode_rows(gold_ids)
+
+        # ---------- extract code blocks ----------
+        extracted_codes = [extract_code_from_qwen_response(txt, lang) for txt in raw_responses]
+        extracted_codes_ref = [extract_code_from_qwen_response(txt, lang) for txt in raw_responses_ref]
+        extracted_codes_gold = [extract_code_from_qwen_response(txt, lang) for txt in raw_gold]
+
+        # ---------- re-tokenize & append EOS ----------
+        eos_id = tokenizer.eos_token_id
+        pad_id = tokenizer.pad_token_id
+        triplets = []
+        for c, r, g in zip(extracted_codes, extracted_codes_ref, extracted_codes_gold):
+            toks_c = tokenizer.encode(c, add_special_tokens=False) + [eos_id]
+            toks_r = tokenizer.encode(r, add_special_tokens=False) + [eos_id]
+            toks_g = tokenizer.encode(g, add_special_tokens=False) + [eos_id]
+            triplets.append((toks_c, toks_r, toks_g))
+
+        # 统一长度（不超过原 policy 输出长度上限，以节约显存）
+        # 你也可以用全局 max(len)；这里采用 min(global_max, policy_original_max)
+        global_max = max(len(x) for tri in triplets for x in tri) if triplets else 1
+        max_len = min(global_max, max_resp)
+
+        def _pad(seq):
+            if len(seq) >= max_len:
+                return seq[:max_len]
+            return seq + [pad_id] * (max_len - len(seq))
+
+        policy_padded = [_pad(x[0]) for x in triplets]
+        ref_padded    = [_pad(x[1]) for x in triplets]
+        gold_padded   = [_pad(x[2]) for x in triplets]
+
+        # ---------- to tensors ----------
+        code_ids_tensor     = torch.tensor(policy_padded, dtype=torch.long, device=code_ids.device)
+        code_ref_ids_tensor = torch.tensor(ref_padded,    dtype=torch.long, device=code_ref_ids.device)
+        gold_ids_tensor     = torch.tensor(gold_padded,   dtype=torch.long, device=gold_ids.device)
+
+        # ---------- call original reward ----------
         return original_get_reward(
             lang=lang,
-            code_ids=extracted_tensor,
-            code_ref_ids=extracted_tensor_ref,
-            gold_ids=extracted_tensor_gold,
-            tokenizer=tokenizer
+            code_ids=code_ids_tensor,
+            code_ref_ids=code_ref_ids_tensor,
+            gold_ids=gold_ids_tensor,
+            tokenizer=tokenizer,
         )
     
     return get_reward_with_extraction
@@ -359,6 +367,15 @@ class TrainingConfig:
     data_path: str = None
     output_path: str = None
     baseline_output_path: str = None
+    
+    # 🔧 新增：检查点保存控制
+    save_steps: int = 1  # 每N轮保存一次检查点，默认每轮都保存
+    max_checkpoints: int = 10  # 最多保留N个检查点，0表示不限制
+    
+    # 🔧 新增：Tensorboard 支持
+    use_tensorboard: bool = True  # 是否启用Tensorboard日志
+    tensorboard_log_dir: str = None  # Tensorboard日志目录，None表示使用默认路径
+    log_every_n_steps: int = 1  # 每N个训练步骤记录一次指标
     
     # 设备配置
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -627,6 +644,30 @@ class CodeTranslationTrainer:
         self.checkpoint_dir = Path(self.config.output_path) / "checkpoints"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
+        # 🔧 新增：初始化 Tensorboard
+        self.tensorboard_writer = None
+        if self.config.use_tensorboard:
+            # 设置Tensorboard日志目录
+            if self.config.tensorboard_log_dir:
+                tb_log_dir = Path(self.config.tensorboard_log_dir)
+            else:
+                tb_log_dir = Path(self.config.output_path) / "tensorboard"
+            
+            # 添加时间戳和运行ID到日志目录
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            tb_log_dir = tb_log_dir / f"run_{self.config.run_id}_{timestamp}"
+            tb_log_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 初始化SummaryWriter
+            self.tensorboard_writer = SummaryWriter(log_dir=str(tb_log_dir))
+            self.logger.info(f"Tensorboard日志保存到: {tb_log_dir}")
+            
+            # 记录配置信息
+            config_text = str(self.config).replace(',', '\n')
+            self.tensorboard_writer.add_text("Config", config_text, 0)
+        else:
+            self.logger.info("Tensorboard日志已禁用")
+            
     def train(self):
         """主训练循环"""
         self.logger.info("开始训练...")
@@ -680,21 +721,27 @@ class CodeTranslationTrainer:
             
     def _generate_code(self, source_ids: torch.Tensor, source_mask: torch.Tensor) -> torch.Tensor:
         """生成代码"""
-        return torch.clone(respond_to_batch(
+        full = respond_to_batch(
             self.model, source_ids, source_mask,
             max_target_length=self.config.max_target_length,
             top_k=self.config.action_space, top_p=1.0,
             tokenizer=self.tokenizer
-        ).detach()[:, 1:])
+        ).detach()
+        # full包含 [prompt | generated]；仅保留generated部分
+        gen_start = source_ids.size(1)
+        return torch.clone(full[:, gen_start:])  # [B, <=max_new_tokens]
         
     def _generate_code_ref(self, source_ids: torch.Tensor, source_mask: torch.Tensor) -> torch.Tensor:
         """生成参考代码"""
-        return torch.clone(respond_to_batch(
+        full = respond_to_batch(
             self.model_ref, source_ids, source_mask,
             max_target_length=self.config.max_target_length,
             top_k=self.config.action_space, top_p=1.0,
             tokenizer=self.tokenizer
-        ).detach()[:, 1:])
+        ).detach()
+        # full包含 [prompt | generated]；仅保留generated部分
+        gen_start = source_ids.size(1)
+        return torch.clone(full[:, gen_start:])  # [B, <=max_new_tokens]
         
     def _compute_reward(self, response_ids: torch.Tensor, response_ids_ref: torch.Tensor, 
                        target_ids: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
@@ -738,6 +785,49 @@ class CodeTranslationTrainer:
         avg_nodes = sum(metrics['num_nodes']) / len(metrics['num_nodes'])
         avg_nodes_ref = sum(metrics['num_nodes_ref']) / len(metrics['num_nodes_ref'])
         
+        # 🔧 新增：记录到 Tensorboard
+        if (self.tensorboard_writer and 
+            self.training_stats['nsteps'] % self.config.log_every_n_steps == 0):
+            
+            global_step = self.training_stats['nsteps']
+            
+            # 奖励相关指标
+            self.tensorboard_writer.add_scalar("Training/Average_Reward", avg_reward, global_step)
+            self.tensorboard_writer.add_scalar("Training/Compilation_Success_Rate", metrics['mean_rate'], global_step)
+            self.tensorboard_writer.add_scalar("Training/AST_Match_Score", metrics['mean_ast_match'], global_step)
+            self.tensorboard_writer.add_scalar("Training/DFG_Match_Score", metrics['mean_dfg_match'], global_step)
+            
+            # 代码质量指标
+            self.tensorboard_writer.add_scalar("Code_Quality/Avg_Errors", avg_errors, global_step)
+            self.tensorboard_writer.add_scalar("Code_Quality/Avg_Errors_Ref", avg_errors_ref, global_step)
+            self.tensorboard_writer.add_scalar("Code_Quality/Avg_Nodes", avg_nodes, global_step)
+            self.tensorboard_writer.add_scalar("Code_Quality/Avg_Nodes_Ref", avg_nodes_ref, global_step)
+            
+            # PPO训练指标
+            if 'objective/kl' in train_stats:
+                self.tensorboard_writer.add_scalar("PPO/KL_Divergence", train_stats['objective/kl'], global_step)
+            if 'objective/entropy' in train_stats:
+                self.tensorboard_writer.add_scalar("PPO/Entropy", train_stats['objective/entropy'], global_step)
+            if 'ppo/loss/total' in train_stats:
+                self.tensorboard_writer.add_scalar("PPO/Total_Loss", train_stats['ppo/loss/total'].item(), global_step)
+            if 'ppo/loss/policy' in train_stats:
+                self.tensorboard_writer.add_scalar("PPO/Policy_Loss", train_stats['ppo/loss/policy'].item(), global_step)
+            if 'ppo/loss/value' in train_stats:
+                self.tensorboard_writer.add_scalar("PPO/Value_Loss", train_stats['ppo/loss/value'].item(), global_step)
+            if 'ppo/policy/advantages_mean' in train_stats:
+                self.tensorboard_writer.add_scalar("PPO/Advantages_Mean", train_stats['ppo/policy/advantages_mean'].item(), global_step)
+            if 'ppo/returns/mean' in train_stats:
+                self.tensorboard_writer.add_scalar("PPO/Returns_Mean", train_stats['ppo/returns/mean'].item(), global_step)
+            if 'ppo/val/mean' in train_stats:
+                self.tensorboard_writer.add_scalar("PPO/Value_Mean", train_stats['ppo/val/mean'].item(), global_step)
+            
+            # 学习率（如果可获取）
+            try:
+                current_lr = self.ppo_trainer.optimizer.param_groups[0]['lr']
+                self.tensorboard_writer.add_scalar("Training/Learning_Rate", current_lr, global_step)
+            except:
+                pass
+        
         # 记录到CSV文件
         csv_line = [
             datetime.datetime.now().strftime("%H:%M:%S"),
@@ -777,6 +867,37 @@ class CodeTranslationTrainer:
         torch.save(model_to_save.state_dict(), checkpoint_path)
         self.logger.info(f"模型已保存到: {checkpoint_path}")
         
+        # 🔧 新增：清理旧检查点
+        self._cleanup_old_checkpoints()
+        
+    def _cleanup_old_checkpoints(self):
+        """清理旧的检查点文件，只保留最新的N个"""
+        if self.config.max_checkpoints <= 0:
+            return  # 不限制检查点数量
+            
+        # 获取所有检查点文件
+        checkpoint_pattern = "pytorch_model_ep*.bin"
+        checkpoint_files = list(self.checkpoint_dir.glob(checkpoint_pattern))
+        
+        if len(checkpoint_files) <= self.config.max_checkpoints:
+            return  # 数量未超限
+            
+        # 按照修改时间排序（最新的在前）
+        checkpoint_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        
+        # 删除超出限制的旧文件
+        files_to_delete = checkpoint_files[self.config.max_checkpoints:]
+        
+        for file_path in files_to_delete:
+            try:
+                file_path.unlink()
+                self.logger.info(f"删除旧检查点: {file_path}")
+            except Exception as e:
+                self.logger.warning(f"删除检查点失败 {file_path}: {e}")
+                
+        if files_to_delete:
+            self.logger.info(f"已清理 {len(files_to_delete)} 个旧检查点，保留最新的 {self.config.max_checkpoints} 个")
+                
     def _evaluate(self, epoch: int):
         """评估模型"""
         self.logger.info(f"开始第 {epoch} 轮评估")
@@ -795,6 +916,22 @@ class CodeTranslationTrainer:
         self.logger.info(f"  训练集 - 模型错误: {train_errors}, 参考模型错误: {train_errors_ref}")
         self.logger.info(f"  测试集 - 模型错误: {test_errors}, 参考模型错误: {test_errors_ref}")
         
+        # 🔧 新增：记录评估指标到 Tensorboard
+        if self.tensorboard_writer:
+            self.tensorboard_writer.add_scalar("Evaluation/Train_Errors", train_errors, epoch)
+            self.tensorboard_writer.add_scalar("Evaluation/Train_Errors_Ref", train_errors_ref, epoch)
+            self.tensorboard_writer.add_scalar("Evaluation/Test_Errors", test_errors, epoch)
+            self.tensorboard_writer.add_scalar("Evaluation/Test_Errors_Ref", test_errors_ref, epoch)
+            
+            # 计算错误率
+            if len(self.train_features) > 0:
+                train_error_rate = train_errors / len(self.train_features)
+                self.tensorboard_writer.add_scalar("Evaluation/Train_Error_Rate", train_error_rate, epoch)
+            
+            if len(self.test_features) > 0:
+                test_error_rate = test_errors / len(self.test_features)
+                self.tensorboard_writer.add_scalar("Evaluation/Test_Error_Rate", test_error_rate, epoch)
+            
     def _evaluate_dataset(self, epoch: int, features: List[InputFeatures], 
                          dataloader: DataLoader, prefix: str) -> Tuple[int, int]:
         """评估数据集"""
@@ -810,17 +947,21 @@ class CodeTranslationTrainer:
                 source_ids, source_mask, target_ids, target_mask, ind = batch
                 
                 # 生成预测
-                preds = respond_to_batch(
+                full_preds = respond_to_batch(
                     self.model, source_ids, source_mask,
                     max_target_length=self.config.max_target_length,
-                    top_k=self.config.action_space, top_p=1.0
-                )[:, 1:]
+                    top_k=self.config.action_space, top_p=1.0,
+                    tokenizer=self.tokenizer
+                )
+                preds = full_preds[:, source_ids.size(1):]
                 
-                preds_ref = respond_to_batch(
+                full_preds_ref = respond_to_batch(
                     self.model_ref, source_ids, source_mask,
                     max_target_length=self.config.max_target_length,
-                    top_k=self.config.action_space, top_p=1.0
-                )[:, 1:]
+                    top_k=self.config.action_space, top_p=1.0,
+                    tokenizer=self.tokenizer
+                )
+                preds_ref = full_preds_ref[:, source_ids.size(1):]
                 
                 # 计算错误数
                 nerrors += sum(self.get_reward_func(
@@ -933,6 +1074,22 @@ def parse_args():
     parser.add_argument("--seed", default=42, type=int,
                        help="随机种子")
     
+    # 🔧 新增：检查点保存控制参数
+    parser.add_argument("--save_steps", default=1, type=int,
+                       help="每N轮保存一次检查点（默认每轮都保存）")
+    parser.add_argument("--max_checkpoints", default=10, type=int,
+                       help="最多保留N个检查点，0表示不限制（默认保留10个）")
+    
+    # 🔧 新增：Tensorboard 支持参数
+    parser.add_argument("--use_tensorboard", action="store_true", default=True,
+                       help="启用Tensorboard日志记录（默认启用）")
+    parser.add_argument("--no_tensorboard", action="store_false", dest="use_tensorboard",
+                       help="禁用Tensorboard日志记录")
+    parser.add_argument("--tensorboard_log_dir", default=None, type=str,
+                       help="Tensorboard日志目录（默认为output_path/tensorboard）")
+    parser.add_argument("--log_every_n_steps", default=1, type=int,
+                       help="每N个训练步骤记录一次指标到Tensorboard（默认每步都记录）")
+    
     return parser.parse_args()
 
 
@@ -959,7 +1116,12 @@ def main():
         action_space=args.action_space,
         num_syn_samples=args.num_syn_samples,
         run_id=args.run_id,
-        seed=args.seed
+        seed=args.seed,
+        save_steps=args.save_steps,
+        max_checkpoints=args.max_checkpoints,
+        use_tensorboard=args.use_tensorboard,
+        tensorboard_log_dir=args.tensorboard_log_dir,
+        log_every_n_steps=args.log_every_n_steps
     )
     
     print("=" * 60)

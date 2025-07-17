@@ -18,7 +18,20 @@ class QwenCoderHeadWithValueModelLocal(nn.Module):
         self.summary = nn.Linear(self.model.config.hidden_size, 1)
 
     def forward(self, input_ids, attention_mask=None, labels=None, decoder_attention_mask=None):
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, output_hidden_states=True)
+        """
+        Wrap HF Qwen causal LM forward.
+        NOTE: 在RL阶段我们通常不需要监督loss；labels可以为None。
+        如果labels为None，则不向HF传labels，避免不必要的cross_entropy计算。
+        """
+        if labels is None:
+            outputs = self.model(input_ids=input_ids,
+                                 attention_mask=attention_mask,
+                                 output_hidden_states=True)
+        else:
+            outputs = self.model(input_ids=input_ids,
+                                 attention_mask=attention_mask,
+                                 labels=labels,
+                                 output_hidden_states=True)
         hidden_states = outputs.hidden_states[-1]
         value = self.summary(self.first_dropout(hidden_states)).squeeze(-1)
         outputs = (outputs.logits, outputs, value)
@@ -45,6 +58,7 @@ class QwenCoderHeadWithValueModelLocal(nn.Module):
 
 
 def respond_to_batch(model, source_ids, attention_mask, max_target_length=400, top_k=5, top_p=1.0, tokenizer=None):
+    print(f"respond_to_batch输入: source_ids={source_ids.shape}, attention_mask={attention_mask.shape}")
     generation_config = {
         'do_sample': True,
         'top_k': top_k,
@@ -59,6 +73,7 @@ def respond_to_batch(model, source_ids, attention_mask, max_target_length=400, t
         attention_mask=attention_mask, 
         **generation_config
     )
+    print(f"respond_to_batch输出: {preds.shape}")
     return preds
 
 # 向后兼容别名
