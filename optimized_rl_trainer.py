@@ -4,14 +4,14 @@
 优化的PPO代码生成强化学习训练程序
 
 主要功能：
-1. 代码翻译任务的PPO训练
+1. 代码翻译任务的PPO训练 - 专为Qwen2.5-Coder设计
 2. 支持多种编程语言对
 3. 基于编译成功率和代码结构的奖励计算
 4. 自适应KL控制和策略裁剪
 5. 详细的训练监控和日志记录
 
 作者：AI Assistant
-版本：1.0
+版本：2.0 - Qwen专用版本
 """
 
 import os
@@ -21,6 +21,7 @@ import numpy as np
 import datetime
 import argparse
 import logging
+import re
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
@@ -36,11 +37,10 @@ from code_parser import (tree_to_token_index, tree_to_token_nodes,
 from tree_sitter import Language, Parser
 from reward import remove_special_tokens, tree_sitter_full_compile, get_reward
 from torch.utils.data import DataLoader, TensorDataset
-from model import respond_to_batch, CodeT5HeadWithValueModelLocal
+from model import respond_to_batch, QwenCoderHeadWithValueModelLocal
 from transformers import AutoTokenizer
 from ppo import PPOTrainer
-from utils import (extract_structure, Example, read_examples, 
-                  convert_examples_to_features, InputFeatures)
+from utils import (extract_structure, Example, InputFeatures)
 from code_prepro.lang_processors import (py_tokenizer, java_tokenizer, cpp_tokenizer,
                                         c_tokenizer, js_tokenizer, php_tokenizer, cs_tokenizer,
                                         py_detokenizer, java_detokenizer, cpp_detokenizer,
@@ -48,9 +48,282 @@ from code_prepro.lang_processors import (py_tokenizer, java_tokenizer, cpp_token
 from compiler.terminal_compiler import TerminalCompiler
 
 
+def extract_code_from_qwen_response(response: str, target_lang: str = "cpp") -> str:
+    """
+    从Qwen模型的回复中提取纯代码
+    
+    Args:
+        response: Qwen模型的完整回复
+        target_lang: 目标语言，用于匹配代码块
+    
+    Returns:
+        提取的纯代码字符串
+    """
+    # 语言名称映射，支持不同的变体
+    lang_patterns = {
+        'cpp': ['cpp', 'c++', 'cxx'],
+        'java': ['java'],
+        'python': ['python', 'py'],
+        'javascript': ['javascript', 'js'],
+        'c': ['c'],
+        'php': ['php'],
+        'c_sharp': ['csharp', 'c#', 'cs']
+    }
+    
+    # 获取目标语言的所有可能模式
+    target_patterns = lang_patterns.get(target_lang, [target_lang])
+    
+    # 尝试匹配代码块
+    for pattern in target_patterns:
+        # 匹配 ```lang\ncode\n``` 格式，转义特殊字符
+        escaped_pattern = re.escape(pattern)
+        code_match = re.search(rf'```{escaped_pattern}\s*\n(.*?)\n```', response, re.DOTALL | re.IGNORECASE)
+        if code_match:
+            return code_match.group(1).strip()
+    
+    # 如果没找到特定语言的代码块，尝试匹配通用代码块
+    code_match = re.search(r'```\s*\n(.*?)\n```', response, re.DOTALL)
+    if code_match:
+        return code_match.group(1).strip()
+    
+    # 如果没有代码块，尝试提取"translation:"后的内容
+    translation_match = re.search(r'translation:\s*\n\n(.+)', response, re.DOTALL | re.IGNORECASE)
+    if translation_match:
+        return translation_match.group(1).strip()
+    
+    # 最后的备选方案：返回去除常见前缀后的内容
+    response = response.strip()
+    prefixes_to_remove = [
+        "Here's the C++ translation:",
+        "Here's the Java translation:",
+        "Here's the Python translation:",
+        "Here's the translation:",
+        "Translation:",
+        "```",
+    ]
+    
+    for prefix in prefixes_to_remove:
+        if response.startswith(prefix):
+            response = response[len(prefix):].strip()
+    
+    # 移除末尾的 ```
+    if response.endswith("```"):
+        response = response[:-3].strip()
+    
+    return response
+
+
+def read_qwen_examples(filename: str, args) -> List[Example]:
+    """
+    从Qwen格式的JSONL文件中读取训练样例
+    
+    Args:
+        filename: JSONL文件路径
+        args: 包含语言配置的参数对象
+    
+    Returns:
+        Example对象列表
+    """
+    examples = []
+    
+    with open(filename, 'r', encoding='utf-8') as f:
+        for idx, line in enumerate(f):
+            if not line.strip():
+                continue
+                
+            try:
+                data = json.loads(line)
+                messages = data.get('messages', [])
+                
+                # 查找user和assistant消息
+                user_message = None
+                assistant_message = None
+                
+                for message in messages:
+                    if message.get('role') == 'user':
+                        user_message = message.get('content', '')
+                    elif message.get('role') == 'assistant':
+                        assistant_message = message.get('content', '')
+                
+                if not user_message or not assistant_message:
+                    continue
+                
+                # 从user消息中提取源代码 - 用于构建Example.source
+                source_code = extract_code_from_qwen_response(user_message, args.source_lang)
+                
+                # 从assistant消息中提取目标代码 - 用于构建Example.target
+                target_code = extract_code_from_qwen_response(assistant_message, args.target_lang)
+                
+                if not source_code or not target_code:
+                    continue
+                
+                # Example的orig字段保存完整的消息，用于tokenization
+                # source_orig: 完整的user prompt，用于模型输入
+                # target_orig: 完整的assistant回复，用于计算loss
+                examples.append(
+                    Example(
+                        idx=idx,
+                        source=source_code,  # 纯代码，用于显示
+                        target=target_code,  # 纯代码，用于显示  
+                        source_orig=user_message,  # 完整prompt，用于tokenization
+                        target_orig=assistant_message  # 完整回复，用于tokenization
+                    )
+                )
+                
+            except (json.JSONDecodeError, KeyError, IndexError) as e:
+                print(f"跳过第{idx+1}行，解析错误: {e}")
+                continue
+    
+    return examples
+
+
+def convert_qwen_examples_to_features(examples, tokenizer, args, stage=None):
+    """
+    将Qwen样例转换为模型输入特征
+    专门处理对话格式的tokenization
+    """
+    features = []
+    for example_index, example in enumerate(examples):
+        # 对于Qwen，我们使用完整的对话消息
+        # source_orig包含完整的user prompt
+        # target_orig包含完整的assistant回复
+        
+        # 可以使用tokenizer的chat template，或者简单拼接
+        if hasattr(tokenizer, 'apply_chat_template'):
+            # 尝试使用chat template
+            try:
+                messages = [
+                    {"role": "user", "content": example.source_orig}
+                ]
+                source_text = tokenizer.apply_chat_template(
+                    messages, add_generation_prompt=True, tokenize=False
+                )
+            except:
+                # 如果失败，使用原始内容
+                source_text = example.source_orig
+        else:
+            source_text = example.source_orig
+            
+        # tokenize source - 直接编码，不需要特殊token
+        source_ids = tokenizer.encode(source_text, max_length=args.max_source_length, 
+                                     truncation=True, add_special_tokens=True)
+        source_mask = [1] * len(source_ids)
+        padding_length = args.max_source_length - len(source_ids)
+        source_ids = [tokenizer.pad_token_id] * padding_length + source_ids  # ✅ left-padding
+        source_mask = [0] * padding_length + source_mask  # ✅ left-padding
+        
+        # tokenize target
+        if stage == "test":
+            target_text = "None"
+        else:
+            target_text = example.target_orig
+            
+        target_ids = tokenizer.encode(target_text, max_length=args.max_target_length,
+                                     truncation=True, add_special_tokens=True)
+        target_mask = [1] * len(target_ids)
+        padding_length = args.max_target_length - len(target_ids)
+        target_ids = [tokenizer.pad_token_id] * padding_length + target_ids  # ✅ left-padding
+        target_mask = [0] * padding_length + target_mask  # ✅ left-padding
+        
+        features.append(InputFeatures(
+            example_index,
+            source_ids,
+            target_ids,
+            source_mask,
+            target_mask,
+            example.target_orig))  # 保存完整回复用于后续处理
+            
+    return features
+
+
+def create_reward_wrapper(original_get_reward):
+    """
+    创建get_reward的包装器，在调用前提取代码
+    """
+    def get_reward_with_extraction(lang, code_ids=None, code_ref_ids=None, gold_ids=None, tokenizer=None):
+        """
+        调用原始get_reward前，先从Qwen响应中提取代码
+        """
+        # 首先解码为完整响应
+        code_ids_np = np.array(code_ids.cpu())
+        eos_positions = []
+        max_len = code_ids_np.shape[1]
+        
+        for id_seq in code_ids_np:
+            if tokenizer.eos_token_id in id_seq:
+                eos_positions.append((id_seq == tokenizer.eos_token_id).argmax())
+            else:
+                eos_positions.append(max_len)
+        
+        # 解码为文本
+        raw_responses = [
+            tokenizer.decode(id_seq[:eos_pos], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            for id_seq, eos_pos in zip(code_ids_np, eos_positions)
+        ]
+        raw_responses_ref = [
+            tokenizer.decode(id_seq[:eos_pos], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            for id_seq, eos_pos in zip(code_ref_ids.cpu().numpy(), eos_positions)
+        ]
+        raw_gold = [
+            tokenizer.decode(id_seq[:eos_pos], skip_special_tokens=True, clean_up_tokenization_spaces=False)
+            for id_seq, eos_pos in zip(gold_ids.cpu().numpy(), eos_positions)
+        ]
+        
+        # 提取代码
+        extracted_codes = [extract_code_from_qwen_response(resp, lang) for resp in raw_responses]
+        extracted_codes_ref = [extract_code_from_qwen_response(resp, lang) for resp in raw_responses_ref]
+        extracted_codes_gold = [extract_code_from_qwen_response(resp, lang) for resp in raw_gold]
+        
+        
+        # 重新编码为token ids
+        extracted_ids = []
+        extracted_ids_ref = []
+        extracted_ids_gold = []
+        
+        # 首先编码所有代码，收集长度信息
+        all_tokens = []
+        for code, code_ref, code_gold in zip(extracted_codes, extracted_codes_ref, extracted_codes_gold):
+            code_tokens = tokenizer.encode(code, add_special_tokens=False)
+            code_ref_tokens = tokenizer.encode(code_ref, add_special_tokens=False)
+            code_gold_tokens = tokenizer.encode(code_gold, add_special_tokens=False)
+            
+            all_tokens.append((code_tokens, code_ref_tokens, code_gold_tokens))
+        
+        # 计算所有代码的最大长度，但不超过原始tensor的长度
+        all_lengths = [len(tokens) for tokens_group in all_tokens for tokens in tokens_group]
+        max_code_len = min(max(all_lengths), max_len) if all_lengths else max_len
+        
+        # 使用统一长度进行填充
+        for code_tokens, code_ref_tokens, code_gold_tokens in all_tokens:
+            # 截断和填充到统一长度
+            code_tokens = code_tokens[:max_code_len] + [tokenizer.pad_token_id] * (max_code_len - len(code_tokens))
+            code_ref_tokens = code_ref_tokens[:max_code_len] + [tokenizer.pad_token_id] * (max_code_len - len(code_ref_tokens))
+            code_gold_tokens = code_gold_tokens[:max_code_len] + [tokenizer.pad_token_id] * (max_code_len - len(code_gold_tokens))
+            
+            extracted_ids.append(code_tokens)
+            extracted_ids_ref.append(code_ref_tokens)
+            extracted_ids_gold.append(code_gold_tokens)
+        
+        # 转换为tensor
+        extracted_tensor = torch.tensor(extracted_ids, device=code_ids.device)
+        extracted_tensor_ref = torch.tensor(extracted_ids_ref, device=code_ids.device)
+        extracted_tensor_gold = torch.tensor(extracted_ids_gold, device=code_ids.device)
+        
+        # 调用原始get_reward函数
+        return original_get_reward(
+            lang=lang,
+            code_ids=extracted_tensor,
+            code_ref_ids=extracted_tensor_ref,
+            gold_ids=extracted_tensor_gold,
+            tokenizer=tokenizer
+        )
+    
+    return get_reward_with_extraction
+
+
 @dataclass
 class TrainingConfig:
-    """训练配置数据类"""
+    """训练配置数据类 - Qwen专用版本"""
     # 语言配置
     source_lang: str
     target_lang: str
@@ -66,8 +339,8 @@ class TrainingConfig:
     
     # 模型配置
     model_path: str
-    max_source_length: int = 300  # 减少输入长度，为输出留出空间
-    max_target_length: int = 200  # 减少输出长度，确保总长度不超过512
+    max_source_length: int = 400
+    max_target_length: int = 400
     
     # 训练配置
     train_batch_size: int = 16
@@ -96,7 +369,7 @@ class TrainingConfig:
 
 
 class CodeTranslationTrainer:
-    """代码翻译PPO训练器"""
+    """代码翻译PPO训练器 - Qwen专用版本"""
     
     def __init__(self, config: TrainingConfig):
         self.config = config
@@ -108,6 +381,9 @@ class CodeTranslationTrainer:
         self.setup_data_loaders()
         self.setup_ppo_trainer()
         self.setup_training_stats()
+        
+        # 创建奖励函数包装器
+        self.get_reward_func = create_reward_wrapper(get_reward)
         
     def setup_logging(self):
         """设置日志系统"""
@@ -142,32 +418,6 @@ class CodeTranslationTrainer:
         self.dir_dict = {
             'javascript': 'Javascript', 'java': 'Java', 'c_sharp': 'C#', 
             'php': 'PHP', 'python': 'Python', 'c': 'C', 'cpp': 'C++'
-        }
-        self.end_dict = {
-            'javascript': 'js', 'java': 'java', 'c_sharp': 'cs', 
-            'php': 'php', 'python': 'py', 'c': 'c', 'cpp': 'cpp'
-        }
-        
-        # 代码处理器映射
-        self.code_tokenizers = {
-            "java": java_tokenizer, "cpp": cpp_tokenizer, "c": c_tokenizer, 
-            "python": py_tokenizer, "javascript": js_tokenizer, 
-            "php": php_tokenizer, "c_sharp": cs_tokenizer
-        }
-        self.code_detokenizers = {
-            "java": java_detokenizer, "cpp": cpp_detokenizer, "c": c_detokenizer,
-            "python": py_detokenizer, "javascript": js_detokenizer,
-            "php": php_detokenizer, "c_sharp": cs_detokenizer
-        }
-        
-        # 编译器映射
-        self.lang2compiler = {
-            "python": TerminalCompiler("Python"),
-            "java": TerminalCompiler("Java"),
-            "cpp": TerminalCompiler("C++"),
-            "c_sharp": TerminalCompiler("C#"),
-            "c": TerminalCompiler("C"),
-            "php": TerminalCompiler("PHP"),
         }
         
     def setup_parsers(self):
@@ -204,19 +454,25 @@ class CodeTranslationTrainer:
         config_path = self.model_dir / 'config.json'
         
         # 加载主模型
-        self.model = CodeT5HeadWithValueModelLocal(config_path)
+        self.model = QwenCoderHeadWithValueModelLocal(config_path)
         self.model.load_model_weights(self.config.model_path, self.config.device)
         self.model.to(self.config.device)
         
         # 加载参考模型（固定不变）
-        self.model_ref = CodeT5HeadWithValueModelLocal(config_path)
+        self.model_ref = QwenCoderHeadWithValueModelLocal(config_path)
         self.model_ref.load_model_weights(self.config.model_path, self.config.device)
         self.model_ref.to(self.config.device)
         
         # 从本地加载tokenizer
         print("正在从本地加载tokenizer...")
         try:
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_dir, local_files_only=True)
+            self.tokenizer = AutoTokenizer.from_pretrained(
+            self.model_dir, 
+            local_files_only=True,
+            trust_remote_code=True,
+            padding_side='left'  # Decoder-only 模型使用 left-padding
+)
+            # 打印调试信息
             print("tokenizer从本地加载完成！")
         except Exception as e:
             raise RuntimeError(f"从本地加载tokenizer失败: {e}")
@@ -266,18 +522,18 @@ class CodeTranslationTrainer:
         self.data_files = self._build_data_paths()
         
         # 加载数据
-        self.train_examples = read_examples(self.data_files['train'], self.config)
-        self.dev_examples = read_examples(self.data_files['dev'], self.config)
-        self.test_examples = read_examples(self.data_files['test'], self.config)
+        self.train_examples = read_qwen_examples(self.data_files['train'], self.config)
+        self.dev_examples = read_qwen_examples(self.data_files['dev'], self.config)
+        self.test_examples = read_qwen_examples(self.data_files['test'], self.config)
         
         # 转换为特征
-        self.train_features = convert_examples_to_features(
+        self.train_features = convert_qwen_examples_to_features(
             self.train_examples, self.tokenizer, self.config, stage='train'
         )
-        self.dev_features = convert_examples_to_features(
+        self.dev_features = convert_qwen_examples_to_features(
             self.dev_examples, self.tokenizer, self.config, stage='train'
         )
-        self.test_features = convert_examples_to_features(
+        self.test_features = convert_qwen_examples_to_features(
             self.test_examples, self.tokenizer, self.config, stage='train'
         )
         
@@ -296,13 +552,15 @@ class CodeTranslationTrainer:
                         f"验证: {len(self.dev_features)}, 测试: {len(self.test_features)}")
         
     def _build_data_paths(self) -> Dict[str, str]:
-        """构建数据文件路径"""
+        """构建Qwen格式数据文件路径"""
         l1, l2 = self.config.source_lang, self.config.target_lang
         
         # 尝试不同的路径组合
         possible_paths = [
-            f"{self.config.data_path}/{self.dir_dict[l1]}-{self.dir_dict[l2]}/",
-            f"{self.config.data_path}/{self.dir_dict[l2]}-{self.dir_dict[l1]}/"
+            f"{self.config.data_path}/qwen/{self.dir_dict[l1]}-{self.dir_dict[l2]}/",
+            f"{self.config.data_path}/qwen/{self.dir_dict[l2]}-{self.dir_dict[l1]}/",
+            f"{self.config.data_path}/{self.dir_dict[l1]}-{self.dir_dict[l2]}/",  # 备选路径
+            f"{self.config.data_path}/{self.dir_dict[l2]}-{self.dir_dict[l1]}/"   # 备选路径
         ]
         
         data_dir = None
@@ -312,17 +570,12 @@ class CodeTranslationTrainer:
                 break
                 
         if data_dir is None:
-            raise FileNotFoundError(f"找不到数据目录: {possible_paths}")
+            raise FileNotFoundError(f"找不到Qwen格式数据目录: {possible_paths}")
             
-        # 构建文件名模板
-        template = (f"{data_dir}train-{self.dir_dict[l1]}-{self.dir_dict[l2]}-tok."
-                   f"{self.end_dict[l1]},{data_dir}train-{self.dir_dict[l1]}-{self.dir_dict[l2]}-tok."
-                   f"{self.end_dict[l2]}")
-        
         return {
-            'train': template,
-            'dev': template.replace('train', 'val'),
-            'test': template.replace('train', 'test')
+            'train': f"{data_dir}train.jsonl",
+            'dev': f"{data_dir}val.jsonl",
+            'test': f"{data_dir}test.jsonl"
         }
         
     def _create_dataloader(self, features: List[InputFeatures], 
@@ -430,7 +683,8 @@ class CodeTranslationTrainer:
         return torch.clone(respond_to_batch(
             self.model, source_ids, source_mask,
             max_target_length=self.config.max_target_length,
-            top_k=self.config.action_space, top_p=1.0
+            top_k=self.config.action_space, top_p=1.0,
+            tokenizer=self.tokenizer
         ).detach()[:, 1:])
         
     def _generate_code_ref(self, source_ids: torch.Tensor, source_mask: torch.Tensor) -> torch.Tensor:
@@ -438,13 +692,14 @@ class CodeTranslationTrainer:
         return torch.clone(respond_to_batch(
             self.model_ref, source_ids, source_mask,
             max_target_length=self.config.max_target_length,
-            top_k=self.config.action_space, top_p=1.0
+            top_k=self.config.action_space, top_p=1.0,
+            tokenizer=self.tokenizer
         ).detach()[:, 1:])
         
     def _compute_reward(self, response_ids: torch.Tensor, response_ids_ref: torch.Tensor, 
                        target_ids: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
         """计算奖励"""
-        reward, mean_rate, mean_ast_match, mean_dfg_match, num_errors, num_errors_ref, num_nodes, num_nodes_ref = get_reward(
+        reward, mean_rate, mean_ast_match, mean_dfg_match, num_errors, num_errors_ref, num_nodes, num_nodes_ref = self.get_reward_func(
             lang=self.config.target_lang,
             code_ids=response_ids,
             code_ref_ids=response_ids_ref,
@@ -568,7 +823,7 @@ class CodeTranslationTrainer:
                 )[:, 1:]
                 
                 # 计算错误数
-                nerrors += sum(get_reward(
+                nerrors += sum(self.get_reward_func(
                     lang=self.config.target_lang,
                     code_ids=preds,
                     code_ref_ids=preds_ref,
@@ -576,7 +831,7 @@ class CodeTranslationTrainer:
                     tokenizer=self.tokenizer
                 )[4])
                 
-                nerrors_ref += sum(get_reward(
+                nerrors_ref += sum(self.get_reward_func(
                     lang=self.config.target_lang,
                     code_ids=preds_ref,
                     code_ref_ids=preds_ref,
@@ -598,13 +853,23 @@ class CodeTranslationTrainer:
                          pred_ids_ref: List, indices: List, features: List[InputFeatures]):
         """保存预测结果"""
         # 解码预测结果
-        predictions = [
+        raw_predictions = [
             self.tokenizer.decode(id, skip_special_tokens=True, clean_up_tokenization_spaces=False)
             for id in pred_ids
         ]
-        predictions_ref = [
+        raw_predictions_ref = [
             self.tokenizer.decode(id, skip_special_tokens=True, clean_up_tokenization_spaces=False)
             for id in pred_ids_ref
+        ]
+        
+        # 从Qwen响应中提取代码
+        predictions = [
+            extract_code_from_qwen_response(pred, self.config.target_lang)
+            for pred in raw_predictions
+        ]
+        predictions_ref = [
+            extract_code_from_qwen_response(pred, self.config.target_lang)
+            for pred in raw_predictions_ref
         ]
         
         # 保存到文件
@@ -619,12 +884,14 @@ class CodeTranslationTrainer:
             for pred, ref, i in zip(predictions, predictions_ref, indices):
                 f_model.write(pred + '\n')
                 f_ref.write(ref + '\n')
-                f_gold.write(features[i].target + '\n')
+                # 对于gold，也需要提取代码
+                gold_code = extract_code_from_qwen_response(features[i].target, self.config.target_lang)
+                f_gold.write(gold_code + '\n')
 
 
 def parse_args():
     """解析命令行参数"""
-    parser = argparse.ArgumentParser(description="优化的PPO代码生成训练程序")
+    parser = argparse.ArgumentParser(description="Qwen2.5-Coder PPO代码生成训练程序")
     
     # 必需参数
     parser.add_argument("--source_lang", required=True, type=str,
@@ -632,9 +899,9 @@ def parse_args():
     parser.add_argument("--target_lang", required=True, type=str,
                        help="目标代码语言")
     parser.add_argument("--model_path", required=True, type=str,
-                       help="预训练模型路径")
+                       help="Qwen2.5-Coder模型路径")
     parser.add_argument("--data_path", required=True, type=str,
-                       help="数据目录路径")
+                       help="Qwen格式数据目录路径")
     parser.add_argument("--output_path", required=True, type=str,
                        help="输出目录路径")
     
@@ -694,6 +961,17 @@ def main():
         run_id=args.run_id,
         seed=args.seed
     )
+    
+    print("=" * 60)
+    print("🚀 Qwen2.5-Coder PPO代码翻译训练程序")
+    print("=" * 60)
+    print(f"📝 源语言: {config.source_lang}")
+    print(f"🎯 目标语言: {config.target_lang}")
+    print(f"🤖 模型路径: {config.model_path}")
+    print(f"📂 数据路径: {config.data_path}")
+    print(f"💾 输出路径: {config.output_path}")
+    print(f"🔧 设备: {config.device}")
+    print("=" * 60)
     
     # 创建训练器并开始训练
     trainer = CodeTranslationTrainer(config)

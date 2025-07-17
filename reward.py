@@ -7,11 +7,55 @@ from compiler.terminal_compiler import TerminalCompiler
 import sys
 from code_parser import DFG_python,DFG_java,DFG_ruby,DFG_go,DFG_php,DFG_javascript,DFG_csharp
 from termcolor import colored
+import subprocess
+import tempfile
+import os
+
+# 设置环境变量以避免 tokenizer 警告
+os.environ['TOKENIZERS_PARALLELISM'] = 'false'
+
 sys.path.insert(0, '/home/grads/parshinshojaee/trl_code/trl_code/rl_code_repo/CodeBLEU/')
 from codebleu.calc_code_bleu import calc_code_bleu
 
 
+def format_code_with_clang_format(code, style='Google'):
+    """使用 clang-format 格式化 C++ 代码"""
+    try:
+        # 设置环境变量避免tokenizer警告
+        env = os.environ.copy()
+        env['TOKENIZERS_PARALLELISM'] = 'false'
+        
+        # 创建临时文件
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.cpp', delete=False) as f:
+            f.write(code)
+            temp_file = f.name
+        
+        # 调用 clang-format
+        result = subprocess.run(
+            ['clang-format', f'--style={style}', temp_file],
+            capture_output=True, text=True, check=True, env=env
+        )
+        
+        # 清理临时文件
+        os.unlink(temp_file)
+        
+        return result.stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # 如果 clang-format 失败或未安装，返回原始代码
+        return code
 
+def calc_code_bl_with_format(reference_code, generated_code, lang, keywords_dir):
+    """计算 CodeBLEU 分数，对 C++ 代码进行格式化预处理"""
+    if lang in ['cpp', 'c']:
+        # 对 C++ 代码进行格式化
+        formatted_reference = format_code_with_clang_format(reference_code)
+        formatted_generated = format_code_with_clang_format(generated_code)
+        result = calc_code_bleu([[formatted_reference]], [formatted_generated], lang, keywords_dir)
+    else:
+        # 其他语言保持原样
+        result = calc_code_bleu([[reference_code]], [generated_code], lang, keywords_dir)
+    
+    return result
 
 
 code_tokenizers = {"java": java_tokenizer, "cpp": cpp_tokenizer, "c": c_tokenizer, "python": py_tokenizer,
@@ -125,8 +169,8 @@ def get_reward(lang, code_ids=None,code_ref_ids=None,gold_ids=None, tokenizer=No
         _, _, did_compile = compilation[i]
         reward = 1 if did_compile else -1
         
-        ast_match = calc_code_bleu([[codes_gold[i]]], [codes[i]], lang, keywords_dir)[2]
-        dfg_match = calc_code_bleu([[codes_gold[i]]], [codes[i]], lang, keywords_dir)[3]
+        ast_match = calc_code_bl_with_format(codes_gold[i], codes[i], lang, keywords_dir)[2]
+        dfg_match = calc_code_bl_with_format(codes_gold[i], codes[i], lang, keywords_dir)[3]
 
         rewards[i, min(eos_positions[i],max_len-1)] = reward + ast_match + dfg_match
         compile_batch += reward

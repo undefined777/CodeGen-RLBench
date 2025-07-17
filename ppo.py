@@ -11,6 +11,7 @@ import torch
 import collections
 import time
 import random
+import logging
 from transformers import RobertaTokenizer
 from utils import (logprobs_from_logits,
                          whiten,
@@ -61,7 +62,8 @@ class PPOTrainer:
         "forward_batch_size": 16,
         "ppo_epochs": 4,
         "device": torch.device("cuda"),
-        'adam_eps': 1e-8
+        'adam_eps': 1e-8,
+        'eos_token_id': 151645  # Qwen2.5-Coder的EOS token ID: <|im_end|>
     }
 
     def __init__(self, model, ref_model, **ppo_params):
@@ -154,9 +156,14 @@ class PPOTrainer:
         kl = logprobs - ref_logprobs
         non_score_reward = -self.kl_ctl.value * kl
         rewards = non_score_reward.clone().detach() 
-        print ('kl reward', rewards.mean(axis=-1))
+        
+        # 记录奖励信息用于调试和监控
+        logger = logging.getLogger(__name__)
+        logger.debug(f'KL reward mean: {rewards.mean(axis=-1)}')
+        
         rewards += scores
-        print ('score reward', scores.sum(axis=-1))
+        logger.debug(f'Score reward sum: {scores.sum(axis=-1)}')
+        
         return rewards, non_score_reward, self.kl_ctl.value
 
 
