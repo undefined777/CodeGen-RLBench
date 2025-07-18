@@ -13,10 +13,10 @@ TENSORBOARD_DIR="${OUTPUT_PATH}/tensorboard"
 # 🎛️ A100优化训练参数
 SOURCE_LANG="java"
 TARGET_LANG="cpp"
-TRAIN_BATCH_SIZE=2        # A100可以支持更大的batch size
+TRAIN_BATCH_SIZE=4        # A100可以支持更大的batch size
 TEST_BATCH_SIZE=4         # 测试时可以用更大的batch
-MAX_SOURCE_LENGTH=800      # 适当增加序列长度
-MAX_TARGET_LENGTH=800
+MAX_SOURCE_LENGTH=400      # 适当增加序列长度
+MAX_TARGET_LENGTH=400
 LEARNING_RATE=1.5e-5       # 稍微增大学习率配合大batch size
 TRAIN_EPOCHS=1000000       # 大量训练轮次
 KL_COEF=0.05              # KL散度系数

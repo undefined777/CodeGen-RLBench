@@ -57,7 +57,7 @@ class PPOTrainer:
         "lam":0.95,
         "cliprange": .2,
         "cliprange_value":.2,
-        "vf_coef":0.1, 
+        "vf_coef":0.5,  # 🔧 增加value function系数，从0.1改为0.5
         "batch_size": 48,
         "forward_batch_size": 16,
         "ppo_epochs": 4,
@@ -247,7 +247,7 @@ class PPOTrainer:
 
         stats = dict(
             loss=dict(policy=pg_loss, value=vf_loss, total=loss),
-            policy=dict(entropy=entropy, approxkl=approxkl,policykl=policykl, clipfrac=pg_clipfrac,
+            policy=dict(entropy=entropy.mean(), approxkl=approxkl,policykl=policykl, clipfrac=pg_clipfrac,
                         advantages=advantages, advantages_mean=torch.mean(advantages), ratio=ratio),
             returns=dict(mean=return_mean, var=return_var),
             val=dict(vpred=torch.mean(vpred), error=torch.mean((vpred - returns) ** 2),
@@ -256,24 +256,45 @@ class PPOTrainer:
         return pg_loss, self.ppo_params['vf_coef'] * vf_loss, flatten_dict(stats)
 
     def record_step_stats(self, kl_coef, **data):
-        """Record training step statistics."""
-        kl = data['logprobs'] - data['ref_logprobs']
-        mean_kl = torch.mean(torch.sum(kl, axis=-1))
-        mean_kl = torch.max(-mean_kl,mean_kl)
-        mean_entropy = torch.mean(torch.sum(-data['logprobs'], axis=1))
-        mean_non_score_reward =torch.mean(torch.sum(data['non_score_reward'], axis=1))
+        """Record training step statistics (normalized, 0D-safe)."""
+        logprobs      = data['logprobs']
+        ref_logprobs  = data['ref_logprobs']
+        non_score_rwd = data['non_score_reward']
+        train_stats   = data.get('train_stats', {})
+
+        # KL per token
+        kl = logprobs - ref_logprobs                          # [B,T]
+        mean_kl = kl.mean().detach().float()                  # scalar
+
+        # Entropy: prefer true policy entropy computed in loss()
+        if 'policy/entropy' in train_stats:
+            mean_entropy = train_stats['policy/entropy'].mean().detach().float()
+        else:
+            # crude fallback
+            mean_entropy = (-logprobs).mean().detach().float()
+
+        # Non-score reward (e.g., -kl term) token-level mean
+        mean_non_score_reward = non_score_rwd.mean().detach().float()
+
         stats = {
             'objective/kl': mean_kl,
-            'objective/kl_dist': kl,
-            'objective/logprobs': data['logprobs'],
-            'objective/ref_logprobs': data['ref_logprobs'],
-            'objective/kl_coef': kl_coef,
+            'objective/kl_dist': kl.detach(),                 # keep full dist (NOT scalar)
+            'objective/logprobs': logprobs.detach(),
+            'objective/ref_logprobs': ref_logprobs.detach(),
+            'objective/kl_coef': torch.as_tensor(kl_coef).float(),
             'objective/entropy': mean_entropy,
             'ppo/mean_non_score_reward': mean_non_score_reward,
         }
-        
 
-        for k, v in data['train_stats'].items():
-            stats[f'ppo/{k}'] = torch.mean(v, axis=0)
-        stats['ppo/val/var_explained'] = 1 - stats['ppo/val/error'] / stats['ppo/returns/var']
+        # fold in train_stats (policy loss, value loss, returns, etc.)
+        for k, v in train_stats.items():
+            # 有些 v 已经是标量，有些是张量；统一做 mean→float
+            stats[f'ppo/{k}'] = torch.as_tensor(v).mean().detach().float()
+
+        # 兼容旧指标：var_explained = 1 - error/returns_var
+        if 'ppo/val/error' in stats and 'ppo/returns/var' in stats:
+            stats['ppo/val/var_explained'] = (
+                1.0 - stats['ppo/val/error'] / (stats['ppo/returns/var'] + 1e-8)
+            )
+
         return stats

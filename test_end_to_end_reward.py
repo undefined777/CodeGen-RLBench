@@ -24,8 +24,11 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from optimized_rl_trainer import (
     extract_code_from_qwen_response,
     create_reward_wrapper,
+    read_qwen_examples,
+    convert_qwen_examples_to_features,
 )
 from reward import get_reward
+from utils import Example
 
 
 def load_qwen_model_and_tokenizer(model_path: str):
@@ -81,98 +84,80 @@ def load_qwen_model_and_tokenizer(model_path: str):
     return tokenizer, model
 
 
-def load_test_samples(data_file: Path, num_samples: int = 5) -> List[Dict]:
-    """从数据集中加载测试样本"""
-    print(f"📂 从 {data_file} 加载 {num_samples} 个测试样本...")
+def load_test_samples(data_file: Path, num_samples: int = 5, args=None) -> List[Example]:
+    """从数据集中加载测试样本，使用optimized_rl_trainer的读取函数"""
+    print(f"📂 从 {data_file} 随机加载 {num_samples} 个测试样本...")
     
     if not data_file.exists():
         raise FileNotFoundError(f"数据文件不存在: {data_file}")
     
-    samples = []
-    with open(data_file, 'r', encoding='utf-8') as f:
-        for i, line in enumerate(f):
-            if len(samples) >= num_samples:
-                break
-            
-            try:
-                data = json.loads(line.strip())
-                messages = data['messages']
-                
-                # 验证数据格式
-                has_user = any(msg['role'] == 'user' for msg in messages)
-                has_assistant = any(msg['role'] == 'assistant' for msg in messages)
-                
-                if has_user and has_assistant:
-                    samples.append(data)
-                    print(f"✅ 样本 {len(samples)}: 加载成功")
-                else:
-                    print(f"⚠️  样本 {i+1}: 格式不完整，跳过")
-                    
-            except Exception as e:
-                print(f"⚠️  样本 {i+1}: 解析失败 - {e}")
+    # 创建临时args对象，如果没有提供的话
+    if args is None:
+        class TempArgs:
+            source_lang = "java"
+            target_lang = "cpp"
+        args = TempArgs()
     
-    print(f"📊 成功加载 {len(samples)} 个测试样本")
+    # 使用optimized_rl_trainer的函数读取所有样本
+    all_examples = read_qwen_examples(str(data_file), args)
+    
+    # 随机采样
+    num_samples = min(num_samples, len(all_examples))
+    samples = random.sample(all_examples, num_samples)
+    
+    for i, sample in enumerate(samples):
+        print(f"✅ 样本 {i+1}: 加载成功")
+    
+    print(f"📊 成功随机加载 {len(samples)} 个测试样本")
     return samples
 
 
-def construct_model_input(sample: Dict, tokenizer) -> Tuple[str, str, str]:
-    """构造模型输入并提取参考答案"""
-    messages = sample['messages']
+def construct_model_input(sample: Example, tokenizer, args=None) -> Tuple[torch.Tensor, torch.Tensor, str, str]:
+    """构造模型输入并提取参考答案，使用optimized_rl_trainer的特征提取函数"""
     
-    # 提取用户输入（Java代码翻译任务）
-    user_content = None
-    assistant_content = None
+    # 创建临时args对象，如果没有提供的话
+    if args is None:
+        class TempArgs:
+            max_source_length = 400
+            max_target_length = 400
+            source_lang = "java"
+            target_lang = "cpp"
+        args = TempArgs()
     
-    for msg in messages:
-        if msg['role'] == 'user':
-            user_content = msg['content']
-        elif msg['role'] == 'assistant':
-            assistant_content = msg['content']
+    # 使用optimized_rl_trainer的函数将Example转换为InputFeatures
+    features = convert_qwen_examples_to_features([sample], tokenizer, args, stage='test')
     
-    # 构造对话格式的输入
-    system_prompt = "You are a helpful assistant for code translation. You specialize in translating Java code to C++ code while maintaining functionality and best practices."
+    if not features:
+        raise ValueError("无法从样本提取特征")
     
-    # 构造输入消息
-    input_messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content}
-    ]
+    feature = features[0]
     
-    # 使用tokenizer的chat template
-    input_text = tokenizer.apply_chat_template(
-        input_messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
+    # 转换为tensor
+    source_ids = torch.tensor(feature.source_ids, dtype=torch.long).unsqueeze(0)  # [1, seq_len]
+    source_mask = torch.tensor(feature.source_mask, dtype=torch.long).unsqueeze(0)  # [1, seq_len]
     
-    return input_text, user_content, assistant_content
+    # 返回张量和原始内容
+    return source_ids, source_mask, sample.source_orig, sample.target_orig
 
 
-def generate_model_response(model, tokenizer, input_text: str, max_new_tokens: int = 512) -> str:
-    """使用模型生成响应"""
+def generate_model_response(model, tokenizer, source_ids: torch.Tensor, source_mask: torch.Tensor, max_new_tokens: int = 512) -> str:
+    """使用模型生成响应，接受预处理的张量输入"""
     print("🤖 模型生成响应...")
-    
-    # Tokenize输入
-    inputs = tokenizer(
-        input_text,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=2048
-    )
     
     # 移动到模型设备
     device = next(model.parameters()).device
-    inputs = {k: v.to(device) for k, v in inputs.items()}
+    source_ids = source_ids.to(device)
+    source_mask = source_mask.to(device)
     
-    print(f"📊 输入长度: {inputs['input_ids'].shape[1]} tokens")
+    print(f"📊 输入长度: {source_ids.shape[1]} tokens")
     
     # 生成响应
     with torch.no_grad():
         start_time = time.time()
         
         outputs = model.generate(
-            **inputs,
+            input_ids=source_ids,
+            attention_mask=source_mask,
             max_new_tokens=max_new_tokens,
             do_sample=True,
             temperature=0.7,
@@ -184,7 +169,7 @@ def generate_model_response(model, tokenizer, input_text: str, max_new_tokens: i
         generation_time = time.time() - start_time
     
     # 解码响应
-    generated_ids = outputs[0][inputs['input_ids'].shape[1]:]  # 只取新生成的部分
+    generated_ids = outputs[0][source_ids.shape[1]:]  # 只取新生成的部分
     response = tokenizer.decode(generated_ids, skip_special_tokens=True)
     
     print(f"⏱️  生成时间: {generation_time:.2f}秒")
@@ -219,7 +204,15 @@ def test_end_to_end_reward():
     # 2. 加载测试样本
     data_file = Path("data/qwen/Java-C++/val.jsonl")
     try:
-        samples = load_test_samples(data_file, num_samples=3)
+        # 创建args对象用于样本加载
+        class TestArgs:
+            source_lang = "java"
+            target_lang = "cpp"
+            max_source_length = 400
+            max_target_length = 400
+        
+        test_args = TestArgs()
+        samples = load_test_samples(data_file, num_samples=3, args=test_args)
     except Exception as e:
         print(f"❌ 样本加载失败: {e}")
         return False
@@ -243,7 +236,7 @@ def test_end_to_end_reward():
         
         try:
             # 构造输入
-            input_text, user_content, reference_assistant = construct_model_input(sample, tokenizer)
+            source_ids, source_mask, user_content, reference_assistant = construct_model_input(sample, tokenizer, test_args)
             
             print(f"📋 用户输入预览:")
             print(f"{user_content[:200]}..." if len(user_content) > 200 else user_content)
@@ -257,7 +250,7 @@ def test_end_to_end_reward():
             print(f"  C++代码长度: {len(reference_cpp)} 字符")
             
             # 模型生成响应
-            generated_response = generate_model_response(model, tokenizer, input_text)
+            generated_response = generate_model_response(model, tokenizer, source_ids, source_mask)
             
             print(f"\n🤖 生成的完整响应:")
             print("-" * 40)

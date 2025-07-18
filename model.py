@@ -7,15 +7,26 @@ class QwenCoderHeadWithValueModelLocal(nn.Module):
     """
     Qwen2.5-Coder模型，只从本地加载，不自动下载预训练权重，只支持safetensors权重。
     """
-    def __init__(self, config_path=None):
+    def __init__(self, model_path=None, torch_dtype=None, device='cpu'):
+        """
+        正确加载本地微调好的 Qwen 模型，并在其上加一个 value head。
+        过去版本用 from_config() + 手动加载权重，容易因架构差异/权重键名不匹配导致模型退化。
+        """
         super().__init__()
-        if config_path and os.path.exists(config_path):
-            config = AutoConfig.from_pretrained(config_path, local_files_only=True)
-        else:
-            raise FileNotFoundError(f"配置文件不存在: {config_path}")
-        self.model = AutoModelForCausalLM.from_config(config)
+        if model_path is None or not os.path.exists(model_path):
+            raise FileNotFoundError(f"模型路径不存在: {model_path}")
+
+        # 直接从本地 checkpoint 加载完整权重和自定义模块
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            local_files_only=True,
+            trust_remote_code=True,
+            torch_dtype=torch_dtype,
+            device_map=None,  # 让调用方再 .to(device)
+        )
         self.first_dropout = nn.Dropout(0.1)
         self.summary = nn.Linear(self.model.config.hidden_size, 1)
+        self.hidden_size = self.model.config.hidden_size
 
     def forward(self, input_ids, attention_mask=None, labels=None, decoder_attention_mask=None):
         """
@@ -37,38 +48,29 @@ class QwenCoderHeadWithValueModelLocal(nn.Module):
         outputs = (outputs.logits, outputs, value)
         return outputs
 
-    def load_model_weights(self, model_path, device='cpu'):
-        """只支持加载safetensors权重，找不到直接报错。"""
-        safetensors_file = os.path.join(model_path, 'model.safetensors')
-        if not os.path.exists(safetensors_file):
-            raise FileNotFoundError(f"在目录 {model_path} 中找不到 model.safetensors 权重文件")
-        
-        from safetensors.torch import load_file
-        state_dict = load_file(safetensors_file, device=device)
-        
-        # 检测权重格式并加载
-        state_dict_keys = list(state_dict.keys())
-        if any(key.startswith('model.') for key in state_dict_keys):
-            # 包含'model.'前缀的权重，移除前缀后加载
-            qwen_state_dict = {k[6:]: v for k, v in state_dict.items() if k.startswith('model.')}
-            self.model.load_state_dict(qwen_state_dict, strict=False)
-        else:
-            # 纯Qwen权重，直接加载
-            self.model.load_state_dict(state_dict, strict=False)
-
+    def load_model_weights(self, *args, **kwargs):
+        """
+        兼容旧接口：现在无需单独加载；模型已在 __init__ 中加载完毕。
+        留空以避免误覆盖。仅打印提示。
+        """
+        print("[QwenCoderHeadWithValueModelLocal] load_model_weights() 已废弃，忽略调用。")
 
 def respond_to_batch(model, source_ids, attention_mask, max_target_length=400, top_k=5, top_p=1.0, tokenizer=None):
+    """
+    从批量 prompt 生成响应。支持 wrapper 或 HF 原始模型。
+    """
     print(f"respond_to_batch输入: source_ids={source_ids.shape}, attention_mask={attention_mask.shape}")
+    hf_model = model.model
     generation_config = {
         'do_sample': True,
         'top_k': top_k,
         'top_p': top_p,
-        'max_new_tokens': max_target_length,
-        'pad_token_id': tokenizer.pad_token_id,
-        'eos_token_id': tokenizer.eos_token_id
+        "max_new_tokens": max_target_length,
+        "pad_token_id": tokenizer.pad_token_id,
+        "eos_token_id": tokenizer.eos_token_id
     }
     generation_config = {k: v for k, v in generation_config.items() if v is not None}
-    preds = model.model.generate(
+    preds = hf_model.generate(
         input_ids=source_ids, 
         attention_mask=attention_mask, 
         **generation_config

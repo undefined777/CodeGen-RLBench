@@ -301,7 +301,7 @@ def create_reward_wrapper(original_get_reward):
         # 统一长度（不超过原 policy 输出长度上限，以节约显存）
         # 你也可以用全局 max(len)；这里采用 min(global_max, policy_original_max)
         global_max = max(len(x) for tri in triplets for x in tri) if triplets else 1
-        max_len = min(global_max, max_resp)
+        max_len = max_resp
 
         def _pad(seq):
             if len(seq) >= max_len:
@@ -467,18 +467,26 @@ class CodeTranslationTrainer:
         print(f"正在加载模型到设备: {self.config.device}")
         print(f"加载模型文件: {self.config.model_path}")
         
-        # 初始化模型结构（不加载预训练权重）
-        config_path = self.model_dir / 'config.json'
-        
-        # 加载主模型
-        self.model = QwenCoderHeadWithValueModelLocal(config_path)
-        self.model.load_model_weights(self.config.model_path, self.config.device)
+        # 直接加载微调好的完整模型（包含架构与权重）——不要再分 config/weight 两步。:contentReference[oaicite:4]{index=4}
+        self.model = QwenCoderHeadWithValueModelLocal(
+            self.config.model_path,
+            torch_dtype=None,              # 保持默认dtype; 下行统一 .to()
+            device=self.config.device,
+        )
         self.model.to(self.config.device)
+        self.model.train() 
         
         # 加载参考模型（固定不变）
-        self.model_ref = QwenCoderHeadWithValueModelLocal(config_path)
-        self.model_ref.load_model_weights(self.config.model_path, self.config.device)
+        self.model_ref = QwenCoderHeadWithValueModelLocal(
+            self.config.model_path,
+            torch_dtype=None,
+            device=self.config.device,
+        )
+        #self.model_ref.load_model_weights(self.config.model_path, self.config.device)
         self.model_ref.to(self.config.device)
+        for p in self.model_ref.parameters():
+            p.requires_grad = False
+        self.model_ref.eval()
         
         # 从本地加载tokenizer
         print("正在从本地加载tokenizer...")
@@ -690,12 +698,12 @@ class CodeTranslationTrainer:
         for batch_idx, batch in enumerate(pbar):
             # 处理批次数据
             batch = tuple(t.to(self.config.device) for t in batch)
-            source_ids, source_mask, target_ids, target_mask, _ = batch
-            
+            # DataLoader 返回 (source_ids, source_mask, target_ids, target_mask, indices)
+            source_ids, source_mask, target_ids, target_mask, ind = batch
             # 生成代码
             response_ids = self._generate_code(source_ids, source_mask)
             response_ids_ref = self._generate_code_ref(source_ids, source_mask)
-            
+
             # 计算奖励
             reward, metrics = self._compute_reward(response_ids, response_ids_ref, target_ids)
             
@@ -805,9 +813,13 @@ class CodeTranslationTrainer:
             
             # PPO训练指标
             if 'objective/kl' in train_stats:
-                self.tensorboard_writer.add_scalar("PPO/KL_Divergence", train_stats['objective/kl'], global_step)
+                self.tensorboard_writer.add_scalar(
+                    "PPO/KL_Divergence", float(train_stats['objective/kl']), global_step
+                )
             if 'objective/entropy' in train_stats:
-                self.tensorboard_writer.add_scalar("PPO/Entropy", train_stats['objective/entropy'], global_step)
+                self.tensorboard_writer.add_scalar(
+                    "PPO/Entropy", float(train_stats['objective/entropy']), global_step
+                )
             if 'ppo/loss/total' in train_stats:
                 self.tensorboard_writer.add_scalar("PPO/Total_Loss", train_stats['ppo/loss/total'].item(), global_step)
             if 'ppo/loss/policy' in train_stats:
@@ -843,8 +855,8 @@ class CodeTranslationTrainer:
             f"{avg_errors_ref:.4f}",
             f"{avg_nodes:.4f}",
             f"{avg_nodes_ref:.4f}",
-            str(train_stats['objective/kl']),
-            str(train_stats['objective/entropy']),
+            str(float(train_stats['objective/kl'])),
+            str(float(train_stats['objective/entropy'])),
             str(train_stats['ppo/loss/total'].item()),
             str(train_stats['ppo/loss/policy'].item()),
             str(train_stats['ppo/loss/value'].item()),
@@ -900,17 +912,20 @@ class CodeTranslationTrainer:
                 
     def _evaluate(self, epoch: int):
         """评估模型"""
+        self.model.eval()
         self.logger.info(f"开始第 {epoch} 轮评估")
         
         # 训练集评估
         train_errors, train_errors_ref = self._evaluate_dataset(
             epoch, self.train_features, self.train_dataloader, 'train'
         )
+        self.model.train()
         
-        # 测试集评估
+            # 测试集评估
         test_errors, test_errors_ref = self._evaluate_dataset(
             epoch, self.test_features, self.test_dataloader, 'test'
         )
+        self.model.train()
         
         self.logger.info(f"Epoch {epoch} 评估结果:")
         self.logger.info(f"  训练集 - 模型错误: {train_errors}, 参考模型错误: {train_errors_ref}")
@@ -931,6 +946,7 @@ class CodeTranslationTrainer:
             if len(self.test_features) > 0:
                 test_error_rate = test_errors / len(self.test_features)
                 self.tensorboard_writer.add_scalar("Evaluation/Test_Error_Rate", test_error_rate, epoch)
+        self.model.train()
             
     def _evaluate_dataset(self, epoch: int, features: List[InputFeatures], 
                          dataloader: DataLoader, prefix: str) -> Tuple[int, int]:
