@@ -22,6 +22,7 @@ from utils import (logprobs_from_logits,
                          stats_to_np,
                          stack_dicts,
                          add_suffix)
+from mem import log_mem, mem_guard
 
 
 class AdaptiveKLController:
@@ -84,41 +85,65 @@ class PPOTrainer:
             self.kl_ctl = FixedKLController(self.ppo_params['init_kl_coef'])
 
 
-    def step(self, source_ids, source_mask, response_ids,response_ids_ref, scores):
-        bs = source_ids.size()[0]
-        timing = dict()
-        t0 = time.time()
+    def step(self, source_ids, source_mask, response_ids, response_ids_ref, scores):
+        """Single PPO optimisation step (batched version)."""
+        bs = source_ids.size(0)
+        timing, t0 = dict(), time.time()
 
+        # 1) Forward pass over policy / reference
         t = time.time()
-        logprobs, ref_logprobs, values = self.batched_forward_pass(source_ids, source_mask, response_ids)
-        timing['time/ppo/forward_pass'] = time.time()-t
+        log_mem("batched_forward_pass")
+        logprobs, ref_logprobs, values = self.batched_forward_pass(
+            source_ids, source_mask, response_ids
+        )
+        log_mem("after batched_forward_pass")
+        timing["time/ppo/forward_pass"] = time.time() - t
 
+        # 2) Compute rewards
         t = time.time()
-        rewards, non_score_reward, kl_coef = self.compute_rewards(scores, logprobs, ref_logprobs)
-        timing['time/ppo/compute_rewards'] = time.time()-t
+        rewards, non_score_reward, kl_coef = self.compute_rewards(
+            scores, logprobs, ref_logprobs
+        )
+        timing["time/ppo/compute_rewards"] = time.time() - t
 
+        # 3) Optimise on *minibatches* sampled from the whole batch
         t = time.time()
         all_stats = []
-        idxs = list(range(bs))
-        max_target_len = response_ids.size()[1]
+        perm = torch.randperm(bs, device=source_ids.device)  # shuffle indices
+        mb_size = self.ppo_params.get("minibatch_size", bs)
+        print(f"mb_size: {mb_size}")
+        log_mem("before train_minibatch")
+        for start in range(0, bs, mb_size):
+            idx = perm[start : start + mb_size]
+            stats = self.train_minibatch(
+                logprobs[idx],
+                values[idx],
+                rewards[idx],
+                source_ids[idx],
+                source_mask[idx],
+                response_ids[idx],
+                response_ids_ref[idx],
+            )
+            all_stats.append(stats)
 
-        for i in range(bs):
-            idx = idxs[i]
-            curr_len = (np.array(response_ids.cpu()[idx,:])==self.ppo_params['eos_token_id']).argmax() + 1
-            train_stats = self.train_minibatch(logprobs[idx:idx+1, :curr_len], values[idx:idx+1, :curr_len],
-                                                rewards[idx:idx+1, :curr_len], source_ids[idx:idx+1],
-                                                source_mask[idx:idx+1], response_ids[idx:idx+1,:curr_len],response_ids_ref[idx:idx+1,:curr_len])
-            all_stats.append(train_stats)
-        
-        timing['time/ppo/optimize_step'] = time.time()-t
-        t = time.time()
+        timing["time/ppo/optimize_step"] = time.time() - t
+
+        # 4) Aggregate & record statistics (保持原逻辑)
         train_stats = stack_dicts(all_stats)
-        train_stats['policy/advantages'] = torch.flatten(train_stats['policy/advantages']).unsqueeze(0)
-        train_stats['policy/ratio'] = torch.flatten(train_stats['policy/ratio']).unsqueeze(0)
+        train_stats["policy/advantages"] = torch.flatten(
+            train_stats["policy/advantages"]
+        ).unsqueeze(0)
+        train_stats["policy/ratio"] = torch.flatten(train_stats["policy/ratio"]).unsqueeze(0)
 
-        stats = self.record_step_stats(scores=scores, logprobs=logprobs, ref_logprobs=ref_logprobs,
-                                       non_score_reward=non_score_reward, train_stats=train_stats,
-                                       kl_coef=kl_coef, response_ids = response_ids)
+        stats = self.record_step_stats(
+            scores=scores,
+            logprobs=logprobs,
+            ref_logprobs=ref_logprobs,
+            non_score_reward=non_score_reward,
+            train_stats=train_stats,
+            kl_coef=kl_coef,
+            response_ids=response_ids,
+        )
         stats = stats_to_np(stats)
         timing['time/ppo/calc_stats'] = time.time()-t
 
@@ -126,6 +151,10 @@ class PPOTrainer:
 
         timing['time/ppo/total'] = time.time()-t0
         stats.update(timing)
+        log_mem("after optimizer.step")
+
+        torch.cuda.empty_cache()   # 关键：释放未用缓存
+        log_mem("after empty_cache")
         return stats
 
 
@@ -167,10 +196,15 @@ class PPOTrainer:
 
     def train_minibatch(self, logprobs, values, rewards, source_ids, source_mask, response_ids,response_ids_ref): 
         """Train one PPO minibatch"""
-        loss_p, loss_v, train_stats  = self.loss(logprobs, values, rewards, source_ids, source_mask, response_ids,response_ids_ref)
+        log_mem("before loss")
+        loss_p, loss_v, train_stats  = self.loss(logprobs, values, rewards, source_ids, source_mask, response_ids)
+        log_mem("after loss")
         loss = loss_p + loss_v 
         self.optimizer.zero_grad()
-        loss.backward()
+        with mem_guard("backward"):
+            loss.backward()
+        log_mem("after backward")
+        print(torch.cuda.memory_summary(device=0, abbreviated=True)[:4000])
         self.optimizer.step()
         self.scheduler.step(self.metric)
         return train_stats
@@ -192,16 +226,16 @@ class PPOTrainer:
         return rewards, non_score_reward, self.kl_ctl.value
 
 
-    def loss(self, old_logprobs, values, rewards, source_ids, source_mask, response_ids, response_ids_ref):
+    def loss(self, old_logprobs, values, rewards, source_ids, source_mask, response_ids):
         lastgaelam = 0
-        advantages_reversed = []
-        gen_len = response_ids.size()[1]
-        for t in reversed(range(gen_len)):
-            nextvalues = values[:, t + 1] if t < gen_len - 1 else 0.0
-            delta = rewards[:, t] + self.ppo_params['gamma'] * nextvalues - values[:, t]
-            lastgaelam = delta + self.ppo_params['gamma'] * self.ppo_params['lam'] * lastgaelam
-            advantages_reversed.append(lastgaelam)
-        advantages = torch.stack(advantages_reversed[::-1]).transpose(0, 1)
+        adv_rev = []
+        T = response_ids.size(1)
+        for t in reversed(range(T)):
+            next_val = values[:, t + 1] if t < T - 1 else 0.0
+            delta = rewards[:, t] + self.ppo_params["gamma"] * next_val - values[:, t]
+            lastgaelam = delta + self.ppo_params["gamma"] * self.ppo_params["lam"] * lastgaelam
+            adv_rev.append(lastgaelam)
+        advantages = torch.stack(adv_rev[::-1]).transpose(0, 1)
 
         returns = advantages + values
         advantages = whiten(advantages)

@@ -361,15 +361,17 @@ def average_torch_dicts(list_of_dicts):
     return average_dict
 
 def stats_to_np(stats_dict):
-    """Cast all torch.tensors in dict to numpy arrays."""
-    new_dict = dict()
+    """Recursively detach / move to CPU / convert to numpy. 兼容 bf16."""
+    new_dict = {}
     for k, v in stats_dict.items():
-        if isinstance(v, torch.Tensor):
+        if torch.is_tensor(v):
+            if v.dtype == torch.bfloat16:
+                v = v.to(torch.float32)  # numpy 不支持 bf16
             new_dict[k] = v.detach().cpu().numpy()
+        elif isinstance(v, dict):
+            new_dict[k] = stats_to_np(v)
         else:
             new_dict[k] = v
-        if np.isscalar(new_dict[k]):
-            new_dict[k] = float(new_dict[k])
     return new_dict
 
 

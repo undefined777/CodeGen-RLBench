@@ -2,6 +2,8 @@ from torch import nn
 import torch
 import os
 from transformers import AutoModelForCausalLM, AutoConfig
+from mem import log_mem, mem_guard
+
 
 class QwenCoderHeadWithValueModelLocal(nn.Module):
     """
@@ -44,6 +46,8 @@ class QwenCoderHeadWithValueModelLocal(nn.Module):
                                  labels=labels,
                                  output_hidden_states=True)
         hidden_states = outputs.hidden_states[-1]
+        if hidden_states.dtype != self.summary.weight.dtype:
+            hidden_states = hidden_states.to(self.summary.weight.dtype)
         value = self.summary(self.first_dropout(hidden_states)).squeeze(-1)
         outputs = (outputs.logits, outputs, value)
         return outputs
@@ -69,13 +73,13 @@ def respond_to_batch(model, source_ids, attention_mask, max_target_length=400, t
         "pad_token_id": tokenizer.pad_token_id,
         "eos_token_id": tokenizer.eos_token_id
     }
-    generation_config = {k: v for k, v in generation_config.items() if v is not None}
-    preds = hf_model.generate(
-        input_ids=source_ids, 
-        attention_mask=attention_mask, 
-        **generation_config
-    )
-    print(f"respond_to_batch输出: {preds.shape}")
+    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+        with mem_guard("generate"):
+            preds = hf_model.generate(input_ids=source_ids,
+                                        attention_mask=attention_mask,
+                                        **generation_config)
+    torch.cuda.empty_cache()
+    log_mem("after empty_cache")
     return preds
 
 # 向后兼容别名

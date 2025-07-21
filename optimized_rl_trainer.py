@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from tqdm import tqdm
 import json
 
+from mem import log_mem, mem_guard
+
 # 🔧 新增：Tensorboard 支持
 from torch.utils.tensorboard import SummaryWriter
 
@@ -466,22 +468,24 @@ class CodeTranslationTrainer:
         
         print(f"正在加载模型到设备: {self.config.device}")
         print(f"加载模型文件: {self.config.model_path}")
-        
+        log_mem("before model + optimizer loaded")
         # 直接加载微调好的完整模型（包含架构与权重）——不要再分 config/weight 两步。:contentReference[oaicite:4]{index=4}
         self.model = QwenCoderHeadWithValueModelLocal(
             self.config.model_path,
-            torch_dtype=None,              # 保持默认dtype; 下行统一 .to()
+            torch_dtype=torch.bfloat16,              # 保持默认dtype; 下行统一 .to()
             device=self.config.device,
         )
+        log_mem("after model loaded")
         self.model.to(self.config.device)
         self.model.train() 
         
         # 加载参考模型（固定不变）
         self.model_ref = QwenCoderHeadWithValueModelLocal(
             self.config.model_path,
-            torch_dtype=None,
+            torch_dtype=torch.bfloat16,
             device=self.config.device,
         )
+        log_mem("after model_ref loaded")
         #self.model_ref.load_model_weights(self.config.model_path, self.config.device)
         self.model_ref.to(self.config.device)
         for p in self.model_ref.parameters():
