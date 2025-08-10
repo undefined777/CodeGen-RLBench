@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import os
 
-# 设置环境变量以避免 tokenizer 警告
+# Set environment variable to avoid tokenizer warning
 os.environ['TOKENIZERS_PARALLELISM'] = 'false'
 
 sys.path.insert(0, '/home/grads/parshinshojaee/trl_code/trl_code/rl_code_repo/CodeBLEU/')
@@ -19,40 +19,40 @@ from codebleu.calc_code_bleu import calc_code_bleu
 
 
 def format_code_with_clang_format(code, style='Google'):
-    """使用 clang-format 格式化 C++ 代码"""
+    """Format C++ code with clang-format"""
     try:
-        # 设置环境变量避免tokenizer警告
+        # Set environment variable to avoid tokenizer warning
         env = os.environ.copy()
         env['TOKENIZERS_PARALLELISM'] = 'false'
         
-        # 创建临时文件
+        # Create temporary file
         with tempfile.NamedTemporaryFile(mode='w', suffix='.cpp', delete=False) as f:
             f.write(code)
             temp_file = f.name
         
-        # 调用 clang-format
+        # Call clang-format
         result = subprocess.run(
             ['clang-format', f'--style={style}', temp_file],
             capture_output=True, text=True, check=True, env=env
         )
         
-        # 清理临时文件
+        # Clean up temporary file
         os.unlink(temp_file)
         
         return result.stdout.strip()
     except (subprocess.CalledProcessError, FileNotFoundError):
-        # 如果 clang-format 失败或未安装，返回原始代码
+        # If clang-format fails or is not installed, return original code
         return code
 
 def calc_code_bl_with_format(reference_code, generated_code, lang, keywords_dir):
-    """计算 CodeBLEU 分数，对 C++ 代码进行格式化预处理"""
+    """Calculate CodeBLEU score, preprocess C++ code with formatting"""
     if lang in ['cpp', 'c']:
-        # 对 C++ 代码进行格式化
+        # Format C++ code
         formatted_reference = format_code_with_clang_format(reference_code)
         formatted_generated = format_code_with_clang_format(generated_code)
         result = calc_code_bleu([[formatted_reference]], [formatted_generated], lang, keywords_dir)
     else:
-        # 其他语言保持原样
+        # Other languages remain unchanged
         result = calc_code_bleu([[reference_code]], [generated_code], lang, keywords_dir)
     
     return result
@@ -125,6 +125,10 @@ def tree_sitter_full_compile(code, lang='python', verbose = False):
 
 def get_reward(lang, code_ids=None,code_ref_ids=None,gold_ids=None, tokenizer=None):
     code_ids = np.array(code_ids.cpu())
+    code_ref_ids = np.array(code_ref_ids.cpu())
+    gold_ids = np.array(gold_ids.cpu())
+    
+    # 🔧 修复：为每个tensor单独计算eos_positions
     eos_positions = []
     max_len = code_ids.shape[1]
     for id in code_ids:
@@ -132,19 +136,38 @@ def get_reward(lang, code_ids=None,code_ref_ids=None,gold_ids=None, tokenizer=No
             eos_positions.append((id==tokenizer.eos_token_id).argmax())
         else:
             eos_positions.append(max_len)
+    
+    # 🔧 修复：为code_ref_ids单独计算eos_positions
+    eos_positions_ref = []
+    max_len_ref = code_ref_ids.shape[1]
+    for id in code_ref_ids:
+        if tokenizer.eos_token_id in id:
+            eos_positions_ref.append((id==tokenizer.eos_token_id).argmax())
+        else:
+            eos_positions_ref.append(max_len_ref)
+    
+    # 🔧 修复：为gold_ids单独计算eos_positions
+    eos_positions_gold = []
+    max_len_gold = gold_ids.shape[1]
+    for id in gold_ids:
+        if tokenizer.eos_token_id in id:
+            eos_positions_gold.append((id==tokenizer.eos_token_id).argmax())
+        else:
+            eos_positions_gold.append(max_len_gold)
 
     codes = [tokenizer.decode(id[:eos_pos], skip_special_tokens=True, clean_up_tokenization_spaces=False) \
              for id,eos_pos in zip(code_ids, eos_positions)]
     codes_ref = [tokenizer.decode(id[:eos_pos], skip_special_tokens=True, clean_up_tokenization_spaces=False) \
-             for id,eos_pos in zip(code_ref_ids, eos_positions)] 
+             for id,eos_pos in zip(code_ref_ids, eos_positions_ref)] 
     codes_gold = [tokenizer.decode(id[:eos_pos], skip_special_tokens=True, clean_up_tokenization_spaces=False) \
-             for id,eos_pos in zip(gold_ids, eos_positions)] 
+             for id,eos_pos in zip(gold_ids, eos_positions_gold)]
         
     codes = [code_detokenizers[lang](code) for code in codes]
     codes_ref = [code_detokenizers[lang](code) for code in codes_ref]
     codes_gold = [code_detokenizers[lang](code) for code in codes_gold]
     
     compilation = [lang2compiler[lang].compile_code_string(code) for code in codes]
+    compilation_ref = [lang2compiler[lang].compile_code_string(code) for code in codes_ref]
 
     codes = [remove_special_tokens(code) for code in codes]
     codes_ref = [remove_special_tokens(code) for code in codes_ref]
@@ -164,9 +187,22 @@ def get_reward(lang, code_ids=None,code_ref_ids=None,gold_ids=None, tokenizer=No
     # dfg_match = calc_code_bleu([codes_gold], codes, lang, keywords_dir)[3]
     
     rewards = np.zeros_like(code_ids, dtype=np.float64)
+    rewards_ref = np.zeros_like(code_ref_ids, dtype=np.float64)
     ast_match_batch = 0
     dfg_match_batch = 0
     compile_batch = 0
+    ast_match_batch_ref = 0
+    dfg_match_batch_ref = 0
+    compile_batch_ref = 0
+    
+    # 新增：每个样本的详细信息
+    sample_compilation_success = []  # 每个样本的编译成功状态
+    sample_ast_match = []           # 每个样本的AST匹配分数
+    sample_dfg_match = []           # 每个样本的DFG匹配分数
+    sample_compilation_success_ref = []  # 参考样本的编译成功状态
+    sample_ast_match_ref = []           # 参考样本的AST匹配分数
+    sample_dfg_match_ref = []           # 参考样本的DFG匹配分数
+    
     for i in range(len(rewards)):
         _, _, did_compile = compilation[i]
         reward = 1 if did_compile else -1
@@ -175,12 +211,61 @@ def get_reward(lang, code_ids=None,code_ref_ids=None,gold_ids=None, tokenizer=No
         dfg_match = calc_code_bl_with_format(codes_gold[i], codes[i], lang, keywords_dir)[3]
 
         rewards[i, min(eos_positions[i],max_len-1)] = reward + ast_match + dfg_match
-        compile_batch += reward
+        # seq_len = eos_positions[i] + 1
+        # per_token_r = reward / seq_len
+        # rewards[i, :seq_len] += per_token_r 
+
+        #total_reward = reward + ast_match + dfg_match
+        #seq_len = min(eos_positions[i],max_len-1)+1
+        #per_token_r = total_reward
+        #rewards[i, :seq_len] += per_token_r 
+        
+        compile_batch += (1 if did_compile else 0) 
         ast_match_batch += ast_match
         dfg_match_batch += dfg_match
+        
+        # 记录每个样本的详细信息
+        sample_compilation_success.append(did_compile)
+        sample_ast_match.append(ast_match)
+        sample_dfg_match.append(dfg_match)
+        
+        # Calculate ref rewards
+        _, _, did_compile_ref = compilation_ref[i]
+        reward_ref = 1 if did_compile_ref else -1
+        
+        ast_match_ref = calc_code_bl_with_format(codes_gold[i], codes_ref[i], lang, keywords_dir)[2]
+        dfg_match_ref = calc_code_bl_with_format(codes_gold[i], codes_ref[i], lang, keywords_dir)[3]
+
+        rewards_ref[i, min(eos_positions[i],max_len-1)] = reward_ref + ast_match_ref + dfg_match_ref
+        # seq_len = eos_positions[i] + 1
+        # per_token_r_ref = reward_ref / seq_len
+        # rewards_ref[i, :seq_len] += per_token_r_ref 
+        
+        compile_batch_ref += (1 if did_compile_ref else 0)
+        ast_match_batch_ref += ast_match_ref
+        dfg_match_batch_ref += dfg_match_ref
+        
+        # 记录参考样本的详细信息
+        sample_compilation_success_ref.append(did_compile_ref)
+        sample_ast_match_ref.append(ast_match_ref)
+        sample_dfg_match_ref.append(dfg_match_ref)
      
     mean_rate = compile_batch/len(codes)
     mean_ast_match =  ast_match_batch/len(codes) 
     mean_dfg_match =  dfg_match_batch/len(codes)  
-    return torch.Tensor(rewards),mean_rate,mean_ast_match,mean_dfg_match, num_errors, num_errors_ref, num_nodes, num_nodes_ref
+    mean_rate_ref = compile_batch_ref/len(codes_ref)
+    mean_ast_match_ref =  ast_match_batch_ref/len(codes_ref) 
+    mean_dfg_match_ref =  dfg_match_batch_ref/len(codes_ref)
+    
+    # 创建详细的样本信息字典
+    sample_details = {
+        'compilation_success': sample_compilation_success,
+        'ast_match': sample_ast_match,
+        'dfg_match': sample_dfg_match,
+        'compilation_success_ref': sample_compilation_success_ref,
+        'ast_match_ref': sample_ast_match_ref,
+        'dfg_match_ref': sample_dfg_match_ref
+    }
+    
+    return torch.Tensor(rewards), torch.Tensor(rewards_ref), mean_rate, mean_ast_match, mean_dfg_match, mean_rate_ref, mean_ast_match_ref, mean_dfg_match_ref, num_errors, num_errors_ref, num_nodes, num_nodes_ref, sample_details
 

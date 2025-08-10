@@ -2,85 +2,164 @@ from torch import nn
 import torch
 import os
 from transformers import AutoModelForCausalLM, AutoConfig
-from mem import log_mem, mem_guard
 
 
 class QwenCoderHeadWithValueModelLocal(nn.Module):
     """
-    Qwen2.5-Coder模型，只从本地加载，不自动下载预训练权重，只支持safetensors权重。
+    Qwen2.5-Coder model, only loads from local, does not automatically download pre-trained weights, only supports safetensors weights.
     """
     def __init__(self, model_path=None, torch_dtype=None, device='cpu'):
-        """
-        正确加载本地微调好的 Qwen 模型，并在其上加一个 value head。
-        过去版本用 from_config() + 手动加载权重，容易因架构差异/权重键名不匹配导致模型退化。
-        """
         super().__init__()
-        if model_path is None or not os.path.exists(model_path):
-            raise FileNotFoundError(f"模型路径不存在: {model_path}")
-
-        # 直接从本地 checkpoint 加载完整权重和自定义模块
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            local_files_only=True,
-            trust_remote_code=True,
-            torch_dtype=torch_dtype,
-            device_map=None,  # 让调用方再 .to(device)
-        )
+        
+        if model_path:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                torch_dtype=torch_dtype,
+                device_map=device,
+                trust_remote_code=True
+            )
+        else:
+            self.model = None
+            
+        self.hidden_size = self.model.config.hidden_size if self.model else 4096
         self.first_dropout = nn.Dropout(0.1)
-        self.summary = nn.Linear(self.model.config.hidden_size, 1)
-        self.hidden_size = self.model.config.hidden_size
+        self.summary = nn.Linear(self.hidden_size, 1)
+        
+        # 🔧 新增：添加config属性以兼容PPO trainer
+        self.config = self.model.config if self.model else None
 
     def forward(self, input_ids, attention_mask=None, labels=None, decoder_attention_mask=None):
         """
         Wrap HF Qwen causal LM forward.
-        NOTE: 在RL阶段我们通常不需要监督loss；labels可以为None。
-        如果labels为None，则不向HF传labels，避免不必要的cross_entropy计算。
         """
         if labels is None:
             outputs = self.model(input_ids=input_ids,
                                  attention_mask=attention_mask,
-                                 output_hidden_states=True)
+                                 output_hidden_states=True,
+                                 use_cache=False,
+                                 return_dict=True)
         else:
             outputs = self.model(input_ids=input_ids,
                                  attention_mask=attention_mask,
                                  labels=labels,
-                                 output_hidden_states=True)
+                                 output_hidden_states=True,
+                                 use_cache=False,
+                                 return_dict=True)
         hidden_states = outputs.hidden_states[-1]
         if hidden_states.dtype != self.summary.weight.dtype:
             hidden_states = hidden_states.to(self.summary.weight.dtype)
         value = self.summary(self.first_dropout(hidden_states)).squeeze(-1)
-        outputs = (outputs.logits, outputs, value)
+        outputs = (outputs.logits, None, value)
         return outputs
 
     def load_model_weights(self, *args, **kwargs):
         """
-        兼容旧接口：现在无需单独加载；模型已在 __init__ 中加载完毕。
-        留空以避免误覆盖。仅打印提示。
+        This function is deprecated, ignoring call.
         """
-        print("[QwenCoderHeadWithValueModelLocal] load_model_weights() 已废弃，忽略调用。")
+        print("[QwenCoderHeadWithValueModelLocal] load_model_weights() is deprecated, ignoring call.")
+    
+    def save_pretrained(self, save_directory, **kwargs):
+        """
+        Save the model and tokenizer to a directory.
+        This method saves the underlying Hugging Face model and adds our custom components.
+        """
+        import os
+        from pathlib import Path
+        
+        save_directory = Path(save_directory)
+        save_directory.mkdir(parents=True, exist_ok=True)
+        
+        # Save the underlying Hugging Face model
+        self.model.save_pretrained(save_directory, **kwargs)
+        
+        # Save our custom components (summary layer and dropout)
+        custom_state_dict = {
+            'summary.weight': self.summary.weight.data,
+            'summary.bias': self.summary.bias.data,
+            'first_dropout.p': 0.1,  # Save dropout rate
+        }
+        
+        # Save custom components to a separate file
+        custom_path = save_directory / "custom_components.bin"
+        torch.save(custom_state_dict, custom_path)
+        
+        # Create a model info file
+        model_info = {
+            "model_type": "QwenCoderHeadWithValueModelLocal",
+            "hidden_size": self.hidden_size,
+            "custom_components": ["summary", "first_dropout"],
+            "save_time": str(torch.cuda.Event() if torch.cuda.is_available() else "cpu")
+        }
+        
+        import json
+        info_path = save_directory / "model_info.json"
+        with open(info_path, 'w', encoding='utf-8') as f:
+            json.dump(model_info, f, indent=2, ensure_ascii=False)
+        
+        print(f"✅ 模型保存到: {save_directory}")
+        print(f"   - 基础模型: {save_directory}")
+        print(f"   - 自定义组件: {custom_path}")
+        print(f"   - 模型信息: {info_path}")
+    
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
+        """
+        Load a model from a pretrained checkpoint.
+        This method loads the underlying Hugging Face model and our custom components.
+        """
+        from pathlib import Path
+        
+        model_path = Path(pretrained_model_name_or_path)
+        
+        # Load the underlying Hugging Face model
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            trust_remote_code=True,
+            **kwargs
+        )
+        
+        # Create our custom model
+        model = cls.__new__(cls)
+        model.model = hf_model
+        model.hidden_size = hf_model.config.hidden_size
+        model.first_dropout = nn.Dropout(0.1)
+        model.summary = nn.Linear(model.hidden_size, 1)
+        
+        # Load custom components if they exist
+        custom_path = model_path / "custom_components.bin"
+        if custom_path.exists():
+            custom_state_dict = torch.load(custom_path, map_location='cpu')
+            model.summary.weight.data = custom_state_dict['summary.weight']
+            model.summary.bias.data = custom_state_dict['summary.bias']
+            print(f"✅ 加载自定义组件: {custom_path}")
+        
+        # Initialize the model properly
+        model.__init__ = lambda *args, **kwargs: None  # Prevent re-initialization
+        return model
 
 def respond_to_batch(model, source_ids, attention_mask, max_target_length=400, top_k=5, top_p=1.0, tokenizer=None):
     """
-    从批量 prompt 生成响应。支持 wrapper 或 HF 原始模型。
+    Generate responses from batch prompts. Supports wrapper or HF original model.
     """
-    print(f"respond_to_batch输入: source_ids={source_ids.shape}, attention_mask={attention_mask.shape}")
+    #print(f"respond_to_batch input: source_ids={source_ids.shape}, attention_mask={attention_mask.shape}")
     hf_model = model.model
     generation_config = {
         'do_sample': True,
         'top_k': top_k,
         'top_p': top_p,
+        'temperature': 0.7,  # 🔧 新增：添加temperature减少重复
+        'repetition_penalty': 1.1,  # 🔧 新增：添加repetition_penalty减少重复
         "max_new_tokens": max_target_length,
         "pad_token_id": tokenizer.pad_token_id,
-        "eos_token_id": tokenizer.eos_token_id
+        "eos_token_id": tokenizer.eos_token_id,
     }
     with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-        with mem_guard("generate"):
-            preds = hf_model.generate(input_ids=source_ids,
-                                        attention_mask=attention_mask,
-                                        **generation_config)
+        preds = hf_model.generate(input_ids=source_ids,
+                                    attention_mask=attention_mask,
+                                    **generation_config)
+        #print("Original complete output："+ tokenizer.decode(preds[0][source_ids.shape[1]:],skip_special_tokens=True))
     torch.cuda.empty_cache()
-    log_mem("after empty_cache")
     return preds
 
-# 向后兼容别名
+# Backward compatibility alias
 CodeT5HeadWithValueModelLocal = QwenCoderHeadWithValueModelLocal

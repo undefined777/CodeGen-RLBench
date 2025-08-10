@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../Qwen2.5-Coder"
+		}
+	],
+	"settings": {}
+}

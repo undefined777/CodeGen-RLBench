@@ -183,3 +183,5 @@ checkpoints/
 # Results
 results/
 outputs/ 
+*.safetensors
+*.0

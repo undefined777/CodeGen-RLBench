@@ -329,12 +329,22 @@ def logprobs_from_logits(logits, labels):
     # return logp
 
 
-def whiten(values, shift_mean=True):
-    """Whiten values."""
-    mean, var = torch.mean(values), torch.var(values)
-    var = torch.nan_to_num(var, nan=1.0)
-    whitened = (values - mean) * torch.rsqrt(var + 1e-8)
-    if not shift_mean:
+def whiten(values, shift_mean=True, eps: float = 1e-8, min_std: float = 1e-3):
+    """
+    Standardise *along batch dim* (dim=0) 以保持序列内部原始方差。
+
+    - 若 `values` 是二维 (B, T) ⇒ 先沿 dim=0 求均值/方差，再广播回去；
+    - 若是一维向量 ⇒ 保持旧行为，只要给 std 加下界即可。
+    """
+    if values.dim() > 1:                       # e.g. (B, T)
+        mean = values.mean(dim=0, keepdim=True)
+        std  = values.std (dim=0, keepdim=True).clamp_min(min_std)
+    else:                                      # 旧的一维用法
+        mean = values.mean()
+        std  = values.std().clamp_min(min_std)
+
+    whitened = (values - mean) / (std + eps)
+    if not shift_mean and values.dim() == 1:
         whitened += mean
     return whitened
 

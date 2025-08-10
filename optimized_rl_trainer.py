@@ -1,18 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-优化的PPO代码生成强化学习训练程序
-
-主要功能：
-1. 代码翻译任务的PPO训练 - 专为Qwen2.5-Coder设计
-2. 支持多种编程语言对
-3. 基于编译成功率和代码结构的奖励计算
-4. 自适应KL控制和策略裁剪
-5. 详细的训练监控和日志记录
-
-作者：AI Assistant
-版本：2.0 - Qwen专用版本
-"""
 
 import os
 import sys
@@ -27,13 +14,13 @@ from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 from tqdm import tqdm
 import json
+import shutil
 
-from mem import log_mem, mem_guard
 
 # 🔧 新增：Tensorboard 支持
 from torch.utils.tensorboard import SummaryWriter
 
-# 项目内部导入
+# Internal imports
 from code_parser import (DFG_python, DFG_java, DFG_ruby, DFG_go, 
                         DFG_php, DFG_javascript, DFG_csharp)
 from code_parser import (tree_to_token_index, tree_to_token_nodes,
@@ -55,16 +42,16 @@ from compiler.terminal_compiler import TerminalCompiler
 
 def extract_code_from_qwen_response(response: str, target_lang: str = "cpp") -> str:
     """
-    从Qwen模型的回复中提取纯代码
+    Extract pure code from Qwen model's response
     
     Args:
-        response: Qwen模型的完整回复
-        target_lang: 目标语言，用于匹配代码块
+        response: Qwen model's complete response
+        target_lang: Target language, used to match code blocks
     
     Returns:
-        提取的纯代码字符串
+        Extracted pure code string
     """
-    # 语言名称映射，支持不同的变体
+    # Language name mapping, support different variants
     lang_patterns = {
         'cpp': ['cpp', 'c++', 'cxx'],
         'java': ['java'],
@@ -75,28 +62,28 @@ def extract_code_from_qwen_response(response: str, target_lang: str = "cpp") -> 
         'c_sharp': ['csharp', 'c#', 'cs']
     }
     
-    # 获取目标语言的所有可能模式
+    # Get all possible patterns for the target language
     target_patterns = lang_patterns.get(target_lang, [target_lang])
     
-    # 尝试匹配代码块
+    # Try to match code blocks
     for pattern in target_patterns:
-        # 匹配 ```lang\ncode\n``` 格式，转义特殊字符
+        # Match ```lang\ncode\n``` format, escape special characters
         escaped_pattern = re.escape(pattern)
         code_match = re.search(rf'```{escaped_pattern}\s*\n(.*?)\n```', response, re.DOTALL | re.IGNORECASE)
         if code_match:
             return code_match.group(1).strip()
     
-    # 如果没找到特定语言的代码块，尝试匹配通用代码块
+    # If no specific language code block is found, try to match generic code blocks
     code_match = re.search(r'```\s*\n(.*?)\n```', response, re.DOTALL)
     if code_match:
         return code_match.group(1).strip()
     
-    # 如果没有代码块，尝试提取"translation:"后的内容
+    # If no code block is found, try to extract content after "translation:"
     translation_match = re.search(r'translation:\s*\n\n(.+)', response, re.DOTALL | re.IGNORECASE)
     if translation_match:
         return translation_match.group(1).strip()
     
-    # 最后的备选方案：返回去除常见前缀后的内容
+    # Last fallback: return content after removing common prefixes
     response = response.strip()
     prefixes_to_remove = [
         "Here's the C++ translation:",
@@ -111,7 +98,7 @@ def extract_code_from_qwen_response(response: str, target_lang: str = "cpp") -> 
         if response.startswith(prefix):
             response = response[len(prefix):].strip()
     
-    # 移除末尾的 ```
+    # Remove trailing ```
     if response.endswith("```"):
         response = response[:-3].strip()
     
@@ -120,14 +107,14 @@ def extract_code_from_qwen_response(response: str, target_lang: str = "cpp") -> 
 
 def read_qwen_examples(filename: str, args) -> List[Example]:
     """
-    从Qwen格式的JSONL文件中读取训练样例
+    Read training examples from Qwen format JSONL file
     
     Args:
-        filename: JSONL文件路径
-        args: 包含语言配置的参数对象
+        filename: JSONL file path
+        args: Parameter object containing language configuration
     
     Returns:
-        Example对象列表
+        List of Example objects
     """
     examples = []
     
@@ -157,10 +144,10 @@ def read_qwen_examples(filename: str, args) -> List[Example]:
                 if not user_message or not assistant_message:
                     continue
                 
-                # 从user消息中提取源代码 - 用于构建Example.source
+                # Extract source code from user message - for building Example.source
                 source_code = extract_code_from_qwen_response(user_message, args.source_lang)
                 
-                # 从assistant消息中提取目标代码 - 用于构建Example.target
+                # Extract target code from assistant message - for building Example.target
                 target_code = extract_code_from_qwen_response(assistant_message, args.target_lang)
                 
                 if not source_code or not target_code:
@@ -170,15 +157,15 @@ def read_qwen_examples(filename: str, args) -> List[Example]:
                     idx=idx,
                     source=source_code,
                     target=target_code,
-                    source_orig=user_message,      # 先存 user；system 单独挂
+                    source_orig=user_message,      # First store user; system is separate
                     target_orig=assistant_message
                 )
-                # 动态挂载 system（若无则空串）
+                # Dynamically mount system (if none, empty string)
                 setattr(e, "system_orig", system_message or "")
                 examples.append(e)
 
             except (json.JSONDecodeError, KeyError, IndexError) as e:
-                print(f"跳过第{idx+1}行，解析错误: {e}")
+                print(f"Skipping line {idx+1}, parsing error: {e}")
                 continue
     
     return examples
@@ -186,39 +173,47 @@ def read_qwen_examples(filename: str, args) -> List[Example]:
 
 def convert_qwen_examples_to_features(examples, tokenizer, args, stage=None):
     """
-    将Qwen样例转换为模型输入特征
-    专门处理对话格式的tokenization
+    Convert Qwen examples to model input features
+    Special handling for tokenization of dialog format
     """
     features = []
     for example_index, example in enumerate(examples):
-        # 对于Qwen，我们使用完整的对话消息
-        # source_orig包含完整的user prompt
-        # target_orig包含完整的assistant回复
+        # For Qwen, we use complete dialog messages
+        # source_orig contains complete user prompt
+        # target_orig contains complete assistant response
         
-        # 可以使用tokenizer的chat template，或者简单拼接
+        # Can use tokenizer's chat template, or simple concatenation
         if hasattr(tokenizer, 'apply_chat_template'):
-            # 尝试使用chat template
+            # Try using chat template
             try:
+                # 强制添加system消息，确保所有输入都包含system指令
+                messages = []
                 if hasattr(example, "system_orig") and example.system_orig:
-                    # 使用样本自带 system
-                    messages = [
-                        {"role": "system", "content": example.system_orig},
-                        {"role": "user", "content": example.source_orig},
-                    ]
+                    # 使用数据中的自定义system消息
+                    system_content = example.system_orig
                 else:
-                    messages = [
-                        {"role": "user", "content": example.source_orig},
-                    ]
+                    # 使用默认的system消息
+                    system_content = "You are a helpful assistant for code translation. You specialize in translating Java code to C++ code while maintaining functionality and best practices."
+                
+                messages.append({"role": "system", "content": system_content})
+                messages.append({"role": "user", "content": example.source_orig})
                 source_text = tokenizer.apply_chat_template(
                     messages, add_generation_prompt=True, tokenize=False
                 ) 
-            except:
-                # 如果失败，使用原始内容
+                # 🔧 新增：验证apply_chat_template结果
+                if hasattr(example, "system_orig") and example.system_orig and "system" not in source_text:
+                    print(f"⚠️ 警告：apply_chat_template结果中缺少system内容")
+                    print(f"   原始system: {example.system_orig[:50]}...")
+                    print(f"   生成结果: {source_text[:100]}...")
+            except Exception as e:
+                # If failed, use original content
+                print(f"❌ apply_chat_template失败: {e}")
+                print(f"   使用原始内容作为fallback")
                 source_text = example.source_orig
         else:
             source_text = example.source_orig
             
-        # tokenize source - 直接编码，不需要特殊token
+        # tokenize source - directly encode, no special tokens
         source_ids = tokenizer.encode(source_text, max_length=args.max_source_length, 
                                      truncation=True, add_special_tokens=True)
         source_mask = [1] * len(source_ids)
@@ -255,7 +250,7 @@ def create_reward_wrapper(original_get_reward):
     Wrap the original `get_reward()` so that *each* of (policy, ref, gold)
     is decoded up to **its own** EOS, code-block extracted, re-tokenized,
     EOS-appended, and padded to a common length *before* reward computation.
-    这样避免将 policy 的 eos 位置误用于 ref/gold（原实现的问题）。
+    This avoids using policy's EOS position for ref/gold (original implementation issue).
     """
     def get_reward_with_extraction(lang, code_ids=None, code_ref_ids=None, gold_ids=None, tokenizer=None):
         # ---------- helpers ----------
@@ -300,14 +295,10 @@ def create_reward_wrapper(original_get_reward):
             toks_g = tokenizer.encode(g, add_special_tokens=False) + [eos_id]
             triplets.append((toks_c, toks_r, toks_g))
 
-        # 统一长度（不超过原 policy 输出长度上限，以节约显存）
-        # 你也可以用全局 max(len)；这里采用 min(global_max, policy_original_max)
-        global_max = max(len(x) for tri in triplets for x in tri) if triplets else 1
-        max_len = max_resp
+        # 使用全局最大长度,保留所有信息
+        max_len = max(len(x) for tri in triplets for x in tri) if triplets else 1
 
         def _pad(seq):
-            if len(seq) >= max_len:
-                return seq[:max_len]
             return seq + [pad_id] * (max_len - len(seq))
 
         policy_padded = [_pad(x[0]) for x in triplets]
@@ -333,12 +324,12 @@ def create_reward_wrapper(original_get_reward):
 
 @dataclass
 class TrainingConfig:
-    """训练配置数据类 - Qwen专用版本"""
-    # 语言配置
+    """Training configuration class - Qwen专用版本"""
+    # Language configuration
     source_lang: str
     target_lang: str
     
-    # 别名，用于兼容旧代码
+    # Aliases, for compatibility with old code
     @property
     def l1(self):
         return self.source_lang
@@ -347,48 +338,65 @@ class TrainingConfig:
     def l2(self):
         return self.target_lang
     
-    # 模型配置
+    # Model configuration
     model_path: str
     max_source_length: int = 400
     max_target_length: int = 400
     
-    # 训练配置
+    # Training configuration
     train_batch_size: int = 16
     test_batch_size: int = 48
     train_epochs: int = 1000000
     learning_rate: float = 1e-5
     kl_coef: float = 0.05
-    kl_target: float = 1.0
+    kl_target: float = 1
     vf_coef: float = 1e-3
     
-    # 生成配置
+    # Generation configuration
     action_space: int = 2  # top_k
     num_syn_samples: int = 5
     
-    # 路径配置
+    # Path configuration
     data_path: str = None
     output_path: str = None
     baseline_output_path: str = None
     
-    # 🔧 新增：检查点保存控制
-    save_steps: int = 1  # 每N轮保存一次检查点，默认每轮都保存
-    max_checkpoints: int = 10  # 最多保留N个检查点，0表示不限制
+    # 🔧 Enhanced: Checkpoint saving control
+    save_every_n_steps: int = 0  # Save checkpoint every N training steps (0 means disabled)
+    max_checkpoints: int = 10  # Maximum number of checkpoints to retain, 0 means no limit
     
-    # 🔧 新增：Tensorboard 支持
-    use_tensorboard: bool = True  # 是否启用Tensorboard日志
-    tensorboard_log_dir: str = None  # Tensorboard日志目录，None表示使用默认路径
-    log_every_n_steps: int = 1  # 每N个训练步骤记录一次指标
+    # 🔧 New: Performance-based saving
+    save_best_only: bool = False  # Only save when performance improves
+    save_metric: str = "reward"  # Metric to track for best model: "reward", "compilation_rate", "ast_match", "dfg_match"
+    save_threshold: float = 0.0  # Minimum improvement threshold for saving
     
-    # 设备配置
+    # 🔧 New: Emergency saving
+    save_on_error: bool = True  # Save checkpoint when training error occurs
+    
+    # 🔧 New: Tensorboard support
+    use_tensorboard: bool = True  # Whether to enable Tensorboard logging
+    tensorboard_log_dir: str = None  # Tensorboard log directory, None means use default path
+    log_every_n_steps: int = 1  # Log metrics every N training steps
+
+    # PPO configuration
+    minibatch_size: int = 1
+    
+    # 🔧 New: Gradient accumulation configuration
+    gradient_accumulation_steps: int = 4  # 梯度累积步数，推荐：batch_size=16时用4步，有效batch=16*4=64
+    
+    # 🔧 New: Critic warmup configuration
+    critic_warmup_steps: int = 0  # critic预热步数，推荐：50-100步让critic先稳定
+    
+    # Device configuration
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # 运行配置
+    # Running configuration
     run_id: int = 1
     seed: int = 42
 
 
 class CodeTranslationTrainer:
-    """代码翻译PPO训练器 - Qwen专用版本"""
+    """Code translation PPO trainer"""
     
     def __init__(self, config: TrainingConfig):
         self.config = config
@@ -401,11 +409,11 @@ class CodeTranslationTrainer:
         self.setup_ppo_trainer()
         self.setup_training_stats()
         
-        # 创建奖励函数包装器
+        # Create reward function wrapper
         self.get_reward_func = create_reward_wrapper(get_reward)
         
     def setup_logging(self):
-        """设置日志系统"""
+        """Setup logging system"""
         log_dir = Path(self.config.output_path) / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         
@@ -418,29 +426,29 @@ class CodeTranslationTrainer:
             ]
         )
         self.logger = logging.getLogger(__name__)
-        self.logger.info(f"训练配置: {self.config}")
+        self.logger.info(f"Training configuration: {self.config}")
         
     def setup_device(self):
-        """设置计算设备"""
+        """Setup computing device"""
         if self.config.device == "cuda" and not torch.cuda.is_available():
-            self.logger.warning("CUDA不可用，切换到CPU")
+            self.logger.warning("CUDA not available, switching to CPU")
             self.config.device = "cpu"
         
         torch.manual_seed(self.config.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed(self.config.seed)
             
-        self.logger.info(f"使用设备: {self.config.device}")
+        self.logger.info(f"Using device: {self.config.device}")
         
     def setup_language_mappings(self):
-        """设置语言映射"""
+        """Setup language mappings"""
         self.dir_dict = {
             'javascript': 'Javascript', 'java': 'Java', 'c_sharp': 'C#', 
             'php': 'PHP', 'python': 'Python', 'c': 'C', 'cpp': 'C++'
         }
         
     def setup_parsers(self):
-        """设置代码解析器"""
+        """Setup code parsers"""
         self.dfg_function = {
             'python': DFG_python, 'java': DFG_java, 'php': DFG_php,
             'javascript': DFG_javascript, 'c_sharp': DFG_csharp,
@@ -456,67 +464,68 @@ class CodeTranslationTrainer:
                 parser = [parser, self.dfg_function[lang]]
                 self.parsers[lang] = parser
             except Exception as e:
-                self.logger.warning(f"无法加载{lang}解析器: {e}")
+                self.logger.warning(f"Failed to load {lang} parser: {e}")
                 
     def setup_models(self):
-        """设置模型和分词器"""
-        # 获取模型文件所在目录
+        """Setup models and tokenizers"""
+        # Get model file directory
         self.model_dir = Path(self.config.model_path)
         
-        # 检查并准备tokenizer和配置文件
+        # Check and prepare tokenizer and config files
         self._check_model_files()
         
-        print(f"正在加载模型到设备: {self.config.device}")
-        print(f"加载模型文件: {self.config.model_path}")
-        log_mem("before model + optimizer loaded")
-        # 直接加载微调好的完整模型（包含架构与权重）——不要再分 config/weight 两步。:contentReference[oaicite:4]{index=4}
+        print(f"Loading model to device: {self.config.device}")
+        print(f"Loading model file: {self.config.model_path}")
+        # Load fine-tuned complete model (including architecture and weights)
         self.model = QwenCoderHeadWithValueModelLocal(
             self.config.model_path,
-            torch_dtype=torch.bfloat16,              # 保持默认dtype; 下行统一 .to()
+            torch_dtype=torch.bfloat16,              # Keep default dtype; below unified .to()
             device=self.config.device,
         )
-        log_mem("after model loaded")
         self.model.to(self.config.device)
         self.model.train() 
         
-        # 加载参考模型（固定不变）
+        # Load reference model (fixed)
         self.model_ref = QwenCoderHeadWithValueModelLocal(
             self.config.model_path,
             torch_dtype=torch.bfloat16,
             device=self.config.device,
         )
-        log_mem("after model_ref loaded")
         #self.model_ref.load_model_weights(self.config.model_path, self.config.device)
         self.model_ref.to(self.config.device)
         for p in self.model_ref.parameters():
             p.requires_grad = False
         self.model_ref.eval()
+
+        #self.model.model.gradient_checkpointing_enable()
+        self.model.model.config.use_cache = False          # Already double-checked in forward
+        self.model_ref.model.config.use_cache = False
         
-        # 从本地加载tokenizer
-        print("正在从本地加载tokenizer...")
+        # Load tokenizer from local
+        print("Loading tokenizer from local...")
         try:
             self.tokenizer = AutoTokenizer.from_pretrained(
             self.model_dir, 
             local_files_only=True,
             trust_remote_code=True,
-            padding_side='left'  # Decoder-only 模型使用 left-padding
+            padding_side='right'
 )
-            # 打印调试信息
-            print("tokenizer从本地加载完成！")
+            # Print debug information
+            print("Tokenizer loaded from local!")
         except Exception as e:
-            raise RuntimeError(f"从本地加载tokenizer失败: {e}")
+            raise RuntimeError(f"Failed to load tokenizer from local: {e}")
         
-        self.logger.info("模型和分词器加载完成")
+        self.logger.info("Models and tokenizers loaded")
         
     def _check_model_files(self):
-        """检查模型必要文件是否存在"""
-        print("检查模型文件...")
+        """Check if model necessary files exist"""
+        print("Checking model files...")
         
-        # 检查模型权重文件
+        # Check model weight file
         if not os.path.exists(self.config.model_path):
-            raise FileNotFoundError(f"模型权重文件不存在: {self.config.model_path}")
+            raise FileNotFoundError(f"Model weight file does not exist: {self.config.model_path}")
         
-        # 检查必要文件是否存在
+        # Check necessary files
         required_files = [
             'config.json',
             'tokenizer.json',
@@ -533,29 +542,29 @@ class CodeTranslationTrainer:
         
         if missing_files:
             raise FileNotFoundError(
-                f"缺少必要的模型文件: {missing_files}\n"
-                f"请确保模型目录 {self.model_dir} 包含所有必要文件:\n"
-                f"  - config.json (模型配置)\n"
-                f"  - tokenizer.json (分词器配置)\n"
-                f"  - vocab.json (词汇表)\n"
-                f"  - merges.txt (BPE合并规则)\n"
-                f"  - special_tokens_map.json (特殊token映射)\n"
-                f"  - {Path(self.config.model_path).name} (模型权重)"
+                f"Missing necessary model files: {missing_files}\n"
+                f"Please ensure model directory {self.model_dir} contains all necessary files:\n"
+                f"  - config.json (model configuration)\n"
+                f"  - tokenizer.json (tokenizer configuration)\n"
+                f"  - vocab.json (vocabulary)\n"
+                f"  - merges.txt (BPE merge rules)\n"
+                f"  - special_tokens_map.json (special token mapping)\n"
+                f"  - {Path(self.config.model_path).name} (model weights)"
             )
         
-        print("✓ 所有必要文件检查通过")
+        print("✓ All necessary files checked")
         
     def setup_data_loaders(self):
-        """设置数据加载器"""
-        # 构建数据文件路径
+        """Setup data loaders"""
+        # Build data file paths
         self.data_files = self._build_data_paths()
         
-        # 加载数据
+        # Load data
         self.train_examples = read_qwen_examples(self.data_files['train'], self.config)
         self.dev_examples = read_qwen_examples(self.data_files['dev'], self.config)
         self.test_examples = read_qwen_examples(self.data_files['test'], self.config)
         
-        # 转换为特征
+        # Convert to features
         self.train_features = convert_qwen_examples_to_features(
             self.train_examples, self.tokenizer, self.config, stage='train'
         )
@@ -566,7 +575,7 @@ class CodeTranslationTrainer:
             self.test_examples, self.tokenizer, self.config, stage='train'
         )
         
-        # 创建数据加载器
+        # Create data loaders
         self.train_dataloader = self._create_dataloader(
             self.train_features, self.config.train_batch_size, shuffle=True
         )
@@ -577,19 +586,19 @@ class CodeTranslationTrainer:
             self.test_features, self.config.test_batch_size, shuffle=False
         )
         
-        self.logger.info(f"数据加载完成 - 训练: {len(self.train_features)}, "
-                        f"验证: {len(self.dev_features)}, 测试: {len(self.test_features)}")
+        self.logger.info(f"Data loaded - train: {len(self.train_features)}, "
+                        f"dev: {len(self.dev_features)}, test: {len(self.test_features)}")
         
     def _build_data_paths(self) -> Dict[str, str]:
-        """构建Qwen格式数据文件路径"""
+        """Build Qwen format data file paths"""
         l1, l2 = self.config.source_lang, self.config.target_lang
         
-        # 尝试不同的路径组合
+        # Try different path combinations
         possible_paths = [
             f"{self.config.data_path}/qwen/{self.dir_dict[l1]}-{self.dir_dict[l2]}/",
             f"{self.config.data_path}/qwen/{self.dir_dict[l2]}-{self.dir_dict[l1]}/",
-            f"{self.config.data_path}/{self.dir_dict[l1]}-{self.dir_dict[l2]}/",  # 备选路径
-            f"{self.config.data_path}/{self.dir_dict[l2]}-{self.dir_dict[l1]}/"   # 备选路径
+            f"{self.config.data_path}/{self.dir_dict[l1]}-{self.dir_dict[l2]}/",  # Alternative paths
+            f"{self.config.data_path}/{self.dir_dict[l2]}-{self.dir_dict[l1]}/"   # Alternative paths
         ]
         
         data_dir = None
@@ -599,7 +608,7 @@ class CodeTranslationTrainer:
                 break
                 
         if data_dir is None:
-            raise FileNotFoundError(f"找不到Qwen格式数据目录: {possible_paths}")
+            raise FileNotFoundError(f"Qwen format data directory not found: {possible_paths}")
             
         return {
             'train': f"{data_dir}train.jsonl",
@@ -609,7 +618,7 @@ class CodeTranslationTrainer:
         
     def _create_dataloader(self, features: List[InputFeatures], 
                           batch_size: int, shuffle: bool = False) -> DataLoader:
-        """创建数据加载器"""
+        """Create data loader"""
         all_source_ids = torch.tensor([f.source_ids for f in features], dtype=torch.long)
         all_source_mask = torch.tensor([f.source_mask for f in features], dtype=torch.long)
         all_target_ids = torch.tensor([f.target_ids for f in features], dtype=torch.long)
@@ -622,7 +631,7 @@ class CodeTranslationTrainer:
         return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
         
     def setup_ppo_trainer(self):
-        """设置PPO训练器"""
+        """Setup PPO trainer"""
         ppo_config = {
             "batch_size": self.config.train_batch_size,
             'eos_token_id': self.tokenizer.eos_token_id,
@@ -630,156 +639,245 @@ class CodeTranslationTrainer:
             "adap_kl_ctrl": True,
             'init_kl_coef': self.config.kl_coef,
             "target": self.config.kl_target,
-            "vf_coef": self.config.vf_coef
+            "vf_coef": self.config.vf_coef,
+            "minibatch_size": self.config.minibatch_size,
+            "gradient_accumulation_steps": self.config.gradient_accumulation_steps,  # 🔧 New: 传递梯度累积参数
+            "critic_warmup_steps": self.config.critic_warmup_steps,  # 🔧 New: 传递critic预热参数
+            "tokenizer": self.tokenizer
         }
         
         self.ppo_trainer = PPOTrainer(self.model, self.model_ref, **ppo_config)
-        self.logger.info("PPO训练器设置完成")
+        self.logger.info("PPO trainer setup complete")
         
     def setup_training_stats(self):
-        """设置训练统计"""
+        """Setup training statistics"""
         self.training_stats = {
             'nsteps': 0,
             'total_nerrors': 0,
             'total_rewards': 0,
+            'total_rewards_ref': 0,
             'total_nnodes': 0,
             'total_nerrors_ref': 0,
             'total_nnodes_ref': 0,
             'total_seen': 0
         }
         
-        # 创建结果目录
+        # 🔧 New: Performance tracking for best model saving
+        self.best_metrics = {
+            'reward': -float('inf'),
+            'compilation_rate': -float('inf'),
+            'ast_match': -float('inf'),
+            'dfg_match': -float('inf')
+        }
+        self.last_save_step = 0  # Track last save step to avoid duplicate saves
+        
+        # Create results directory
         self.results_dir = Path(self.config.output_path) / "results"
         self.results_dir.mkdir(parents=True, exist_ok=True)
         
-        # 创建检查点目录
+        # Create checkpoint directory
         self.checkpoint_dir = Path(self.config.output_path) / "checkpoints"
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
-        # 🔧 新增：初始化 Tensorboard
+        # 🔧 New: Initialize Tensorboard
         self.tensorboard_writer = None
         if self.config.use_tensorboard:
-            # 设置Tensorboard日志目录
+            # Set Tensorboard log directory
             if self.config.tensorboard_log_dir:
                 tb_log_dir = Path(self.config.tensorboard_log_dir)
             else:
                 tb_log_dir = Path(self.config.output_path) / "tensorboard"
             
-            # 添加时间戳和运行ID到日志目录
+            # Add timestamp and run ID to log directory
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
             tb_log_dir = tb_log_dir / f"run_{self.config.run_id}_{timestamp}"
             tb_log_dir.mkdir(parents=True, exist_ok=True)
             
-            # 初始化SummaryWriter
+            # Initialize SummaryWriter
             self.tensorboard_writer = SummaryWriter(log_dir=str(tb_log_dir))
-            self.logger.info(f"Tensorboard日志保存到: {tb_log_dir}")
+            self.logger.info(f"Tensorboard logs saved to: {tb_log_dir}")
             
-            # 记录配置信息
+            # Record configuration information
             config_text = str(self.config).replace(',', '\n')
             self.tensorboard_writer.add_text("Config", config_text, 0)
         else:
-            self.logger.info("Tensorboard日志已禁用")
+            self.logger.info("Tensorboard logging disabled")
             
     def train(self):
-        """主训练循环"""
-        self.logger.info("开始训练...")
+        """Main training loop"""
+        self.logger.info("Starting training...")
+        
+        # 🔧 New: 记录训练配置信息
+        if self.config.critic_warmup_steps > 0:
+            self.logger.info(f"🔥 Critic warmup enabled: {self.config.critic_warmup_steps} steps")
+            self.logger.info(f"   - Phase 1: Steps 0-{self.config.critic_warmup_steps-1} (Critic only)")
+            self.logger.info(f"   - Phase 2: Steps {self.config.critic_warmup_steps}+ (Joint training)")
+        else:
+            self.logger.info("🔥 Joint actor-critic training from start (no warmup)")
         
         for epoch in range(self.config.train_epochs):
-            self.logger.info(f"开始第 {epoch} 轮训练")
+            self.logger.info(f"Starting epoch {epoch}")
             
-            # 每轮进行多次采样
+            # For each epoch, perform multiple samples
             for sample_idx in range(self.config.num_syn_samples):
                 self._train_epoch(epoch, sample_idx)
                 
-            # 保存模型和评估
-            self._save_checkpoint(epoch)
+            # Save model and evaluate (every epoch by default)
+            self._save_checkpoint(epoch, save_type="epoch")
             self._evaluate(epoch)
             
     def _train_epoch(self, epoch: int, sample_idx: int):
-        """训练一个epoch"""
+        """Train one epoch"""
         pbar = tqdm(self.train_dataloader, desc=f"Epoch {epoch}, Sample {sample_idx}")
         
         for batch_idx, batch in enumerate(pbar):
-            # 处理批次数据
-            batch = tuple(t.to(self.config.device) for t in batch)
-            # DataLoader 返回 (source_ids, source_mask, target_ids, target_mask, indices)
-            source_ids, source_mask, target_ids, target_mask, ind = batch
-            # 生成代码
-            response_ids = self._generate_code(source_ids, source_mask)
-            response_ids_ref = self._generate_code_ref(source_ids, source_mask)
+            try:
+                # Process batch data
+                batch = tuple(t.to(self.config.device) for t in batch)
+                # DataLoader returns (source_ids, source_mask, target_ids, target_mask, indices)
+                source_ids, source_mask, target_ids, target_mask, ind = batch
+                # Generate code
+                response_ids = self._generate_code(source_ids, source_mask)
+                response_ids_ref = self._generate_code_ref(source_ids, source_mask)
 
-            # 计算奖励
-            reward, metrics = self._compute_reward(response_ids, response_ids_ref, target_ids)
-            
-            # 更新统计信息
-            self._update_stats(reward, metrics, len(source_ids))
-            
-            # PPO训练步骤
-            train_stats = self.ppo_trainer.step(
-                source_ids, source_mask, response_ids, response_ids_ref, 
-                reward.to(self.config.device)
-            )
-            
-            # 更新进度条
-            pbar.set_description(
-                f"Epoch {epoch}, Sample {sample_idx}, "
-                f"Avg Errors: {self.training_stats['total_nerrors']/self.training_stats['total_seen']:.5f}"
-            )
-            
-            # 记录训练统计
-            self._log_training_step(epoch, sample_idx, batch_idx, reward, metrics, train_stats)
-            
-            self.training_stats['nsteps'] += 1
-            
+                response_mask = self._get_response_mask(response_ids)
+
+                # Compute reward
+                reward, metrics = self._compute_reward(response_ids, response_ids_ref, target_ids)
+
+                
+                # 🔧 新增：保存模型输出状态到文件
+                self._save_model_output_state(epoch, sample_idx, batch_idx, source_ids, response_ids, response_ids_ref, reward, metrics)
+                
+                # Update statistics
+                self._update_stats(reward, metrics, len(source_ids))
+                
+                # PPO training step
+                train_stats = self.ppo_trainer.step(
+                    source_ids, source_mask, response_ids, response_ids_ref, 
+                    reward.to(self.config.device), response_mask.to(self.config.device)
+                )
+                
+                # Update progress bar
+                avg_errors = self.training_stats['total_nerrors']/self.training_stats['total_seen']
+                avg_reward = self.training_stats['total_rewards']/self.training_stats['total_seen']
+                
+                # 🔧 New: 添加训练阶段信息到进度条
+                if self.config.critic_warmup_steps > 0:
+                    if self.training_stats['nsteps'] < self.config.critic_warmup_steps:
+                        phase_info = f"[Critic Warmup {self.training_stats['nsteps']}/{self.config.critic_warmup_steps}]"
+                    else:
+                        phase_info = "[Joint Training]"
+                else:
+                    phase_info = ""
+                
+                pbar.set_description(
+                    f"Epoch {epoch}, Sample {sample_idx} {phase_info}, "
+                    f"Avg Errors: {avg_errors:.3f}, Avg Reward: {avg_reward:.3f}"
+                )
+                
+                # Record training statistics
+                self._log_training_step(epoch, sample_idx, batch_idx, reward, metrics, train_stats)
+                
+                self.training_stats['nsteps'] += 1
+                
+                # 🔧 New: Step-based saving
+                if (self.config.save_every_n_steps > 0 and 
+                    self.training_stats['nsteps'] % self.config.save_every_n_steps == 0):
+                    self._save_checkpoint(epoch, save_type="step", step=self.training_stats['nsteps'])
+                
+                # 🔧 New: Performance-based saving
+                if self._should_save_best_model(metrics):
+                    self._save_checkpoint(epoch, save_type="best", step=self.training_stats['nsteps'])
+                    
+            except Exception as e:
+                self.logger.error(f"Error during training step: {e}")
+                if self.config.save_on_error:
+                    self._save_checkpoint(epoch, save_type="emergency", step=self.training_stats['nsteps'])
+                raise e
+        
     def _generate_code(self, source_ids: torch.Tensor, source_mask: torch.Tensor) -> torch.Tensor:
-        """生成代码"""
+        """Generate code"""
         full = respond_to_batch(
             self.model, source_ids, source_mask,
             max_target_length=self.config.max_target_length,
             top_k=self.config.action_space, top_p=1.0,
             tokenizer=self.tokenizer
         ).detach()
-        # full包含 [prompt | generated]；仅保留generated部分
+        # full contains [prompt | generated]; only keep generated part
         gen_start = source_ids.size(1)
         return torch.clone(full[:, gen_start:])  # [B, <=max_new_tokens]
         
     def _generate_code_ref(self, source_ids: torch.Tensor, source_mask: torch.Tensor) -> torch.Tensor:
-        """生成参考代码"""
+        """Generate reference code"""
         full = respond_to_batch(
             self.model_ref, source_ids, source_mask,
             max_target_length=self.config.max_target_length,
             top_k=self.config.action_space, top_p=1.0,
             tokenizer=self.tokenizer
         ).detach()
-        # full包含 [prompt | generated]；仅保留generated部分
+        # full contains [prompt | generated]; only keep generated part
         gen_start = source_ids.size(1)
         return torch.clone(full[:, gen_start:])  # [B, <=max_new_tokens]
         
+    def _get_response_mask(self, response_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Create mask for response sequences based on EOS token positions
+        
+        Args:
+            response_ids: Response token sequences [batch_size, seq_len]
+            
+        Returns:
+            mask: Mask tensor where 1 indicates valid positions, 0 indicates padding
+        """
+        batch_size, seq_len = response_ids.shape
+        masks = torch.zeros_like(response_ids, dtype=torch.float)
+        
+        for i, seq in enumerate(response_ids):
+            # Find EOS token position
+            eos_pos = (seq == self.tokenizer.eos_token_id).nonzero()
+            if len(eos_pos) > 0:
+                eos_pos = eos_pos[0].item()
+            else:
+                eos_pos = seq_len - 1
+            
+            # Create mask: valid positions (including EOS) are 1, padding positions are 0
+            valid_length = eos_pos + 1
+            masks[i, :valid_length] = 1.0
+        
+        return masks
+        
     def _compute_reward(self, response_ids: torch.Tensor, response_ids_ref: torch.Tensor, 
                        target_ids: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
-        """计算奖励"""
-        reward, mean_rate, mean_ast_match, mean_dfg_match, num_errors, num_errors_ref, num_nodes, num_nodes_ref = self.get_reward_func(
+        """Compute reward"""
+        reward, reward_ref, mean_rate, mean_ast_match, mean_dfg_match, mean_rate_ref, mean_ast_match_ref, mean_dfg_match_ref, num_errors, num_errors_ref, num_nodes, num_nodes_ref, sample_details = self.get_reward_func(
             lang=self.config.target_lang,
             code_ids=response_ids,
             code_ref_ids=response_ids_ref,
             gold_ids=target_ids,
             tokenizer=self.tokenizer
         )
+
         
         metrics = {
             'mean_rate': mean_rate,
             'mean_ast_match': mean_ast_match,
             'mean_dfg_match': mean_dfg_match,
+            'mean_rate_ref': mean_rate_ref,
+            'mean_ast_match_ref': mean_ast_match_ref,
+            'mean_dfg_match_ref': mean_dfg_match_ref,
             'num_errors': num_errors,
             'num_errors_ref': num_errors_ref,
             'num_nodes': num_nodes,
-            'num_nodes_ref': num_nodes_ref
+            'num_nodes_ref': num_nodes_ref,
+            'reward_ref': reward_ref,
+            'sample_details': sample_details  # 新增：每个样本的详细信息
         }
         
         return reward, metrics
         
     def _update_stats(self, reward: torch.Tensor, metrics: Dict, batch_size: int):
-        """更新训练统计"""
+        """Update training statistics"""
         self.training_stats['total_rewards'] += float(sum(reward.sum(axis=-1).tolist()))
         self.training_stats['total_nerrors'] += sum(metrics['num_errors'])
         self.training_stats['total_nnodes'] += sum(metrics['num_nodes'])
@@ -787,35 +885,55 @@ class CodeTranslationTrainer:
         self.training_stats['total_nnodes_ref'] += sum(metrics['num_nodes_ref'])
         self.training_stats['total_seen'] += batch_size
         
+        # Add ref rewards statistics
+        if 'total_rewards_ref' not in self.training_stats:
+            self.training_stats['total_rewards_ref'] = 0
+        self.training_stats['total_rewards_ref'] += float(sum(metrics['reward_ref'].sum(axis=-1).tolist()))
+        
     def _log_training_step(self, epoch: int, sample_idx: int, batch_idx: int,
                           reward: torch.Tensor, metrics: Dict, train_stats: Dict):
-        """记录训练步骤"""
-        # 计算平均指标
+        """Record training step"""
+        # Calculate average metrics
         avg_reward = float(sum(reward.sum(axis=-1).tolist())) / len(reward)
+        avg_reward_ref = float(sum(metrics['reward_ref'].sum(axis=-1).tolist())) / len(metrics['reward_ref'])
         avg_errors = sum(metrics['num_errors']) / len(metrics['num_errors'])
         avg_errors_ref = sum(metrics['num_errors_ref']) / len(metrics['num_errors_ref'])
         avg_nodes = sum(metrics['num_nodes']) / len(metrics['num_nodes'])
         avg_nodes_ref = sum(metrics['num_nodes_ref']) / len(metrics['num_nodes_ref'])
         
-        # 🔧 新增：记录到 Tensorboard
+        # 🔧 New: Record to Tensorboard
         if (self.tensorboard_writer and 
             self.training_stats['nsteps'] % self.config.log_every_n_steps == 0):
             
             global_step = self.training_stats['nsteps']
             
-            # 奖励相关指标
+            # Reward-related metrics
             self.tensorboard_writer.add_scalar("Training/Average_Reward", avg_reward, global_step)
+            self.tensorboard_writer.add_scalar("Training/Average_Reward_Ref", avg_reward_ref, global_step)
             self.tensorboard_writer.add_scalar("Training/Compilation_Success_Rate", metrics['mean_rate'], global_step)
+            self.tensorboard_writer.add_scalar("Training/Compilation_Success_Rate_Ref", metrics['mean_rate_ref'], global_step)
             self.tensorboard_writer.add_scalar("Training/AST_Match_Score", metrics['mean_ast_match'], global_step)
+            self.tensorboard_writer.add_scalar("Training/AST_Match_Score_Ref", metrics['mean_ast_match_ref'], global_step)
             self.tensorboard_writer.add_scalar("Training/DFG_Match_Score", metrics['mean_dfg_match'], global_step)
+            self.tensorboard_writer.add_scalar("Training/DFG_Match_Score_Ref", metrics['mean_dfg_match_ref'], global_step)
             
-            # 代码质量指标
+            # Comparison metrics: Policy vs Ref
+            self.tensorboard_writer.add_scalar("Comparison/Reward_Difference", avg_reward - avg_reward_ref, global_step)
+            self.tensorboard_writer.add_scalar("Comparison/Compilation_Rate_Difference", metrics['mean_rate'] - metrics['mean_rate_ref'], global_step)
+            self.tensorboard_writer.add_scalar("Comparison/AST_Match_Difference", metrics['mean_ast_match'] - metrics['mean_ast_match_ref'], global_step)
+            self.tensorboard_writer.add_scalar("Comparison/DFG_Match_Difference", metrics['mean_dfg_match'] - metrics['mean_dfg_match_ref'], global_step)
+            self.tensorboard_writer.add_scalar("Comparison/Error_Difference", avg_errors - avg_errors_ref, global_step)
+            
+            # Code quality metrics
             self.tensorboard_writer.add_scalar("Code_Quality/Avg_Errors", avg_errors, global_step)
             self.tensorboard_writer.add_scalar("Code_Quality/Avg_Errors_Ref", avg_errors_ref, global_step)
             self.tensorboard_writer.add_scalar("Code_Quality/Avg_Nodes", avg_nodes, global_step)
             self.tensorboard_writer.add_scalar("Code_Quality/Avg_Nodes_Ref", avg_nodes_ref, global_step)
+
+            self.tensorboard_writer.add_scalar("Code_Quality/Avg_NonScore_Rwd", train_stats['ppo/mean_non_score_reward'], global_step)
+            self.tensorboard_writer.add_scalar("Code_Quality/Avg_Score", train_stats['ppo/mean_score_reward'], global_step)
             
-            # PPO训练指标
+            # PPO training metrics
             if 'objective/kl' in train_stats:
                 self.tensorboard_writer.add_scalar(
                     "PPO/KL_Divergence", float(train_stats['objective/kl']), global_step
@@ -832,19 +950,52 @@ class CodeTranslationTrainer:
                 self.tensorboard_writer.add_scalar("PPO/Value_Loss", train_stats['ppo/loss/value'].item(), global_step)
             if 'ppo/policy/advantages_mean' in train_stats:
                 self.tensorboard_writer.add_scalar("PPO/Advantages_Mean", train_stats['ppo/policy/advantages_mean'].item(), global_step)
+            
+            # 🔧 New: Advantages详细统计信息
+            # 原始advantages (标准化前)
+            if 'ppo/advantages_raw_mean' in train_stats:
+                self.tensorboard_writer.add_scalar("PPO/Advantages_Raw_Mean", train_stats['ppo/advantages_raw_mean'], global_step)
+            if 'ppo/advantages_raw_std' in train_stats:
+                self.tensorboard_writer.add_scalar("PPO/Advantages_Raw_Std", train_stats['ppo/advantages_raw_std'], global_step)
+            if 'ppo/advantages_raw_max' in train_stats:
+                self.tensorboard_writer.add_scalar("PPO/Advantages_Raw_Max", train_stats['ppo/advantages_raw_max'], global_step)
+            if 'ppo/advantages_raw_min' in train_stats:
+                self.tensorboard_writer.add_scalar("PPO/Advantages_Raw_Min", train_stats['ppo/advantages_raw_min'], global_step)
+            
+            # 标准化后advantages (用于训练)
+            if 'ppo/advantages_normalized_mean' in train_stats:
+                self.tensorboard_writer.add_scalar("PPO/Advantages_Normalized_Mean", train_stats['ppo/advantages_normalized_mean'], global_step)
+            if 'ppo/advantages_normalized_std' in train_stats:
+                self.tensorboard_writer.add_scalar("PPO/Advantages_Normalized_Std", train_stats['ppo/advantages_normalized_std'], global_step)
+            if 'ppo/advantages_normalized_max' in train_stats:
+                self.tensorboard_writer.add_scalar("PPO/Advantages_Normalized_Max", train_stats['ppo/advantages_normalized_max'], global_step)
+            if 'ppo/advantages_normalized_min' in train_stats:
+                self.tensorboard_writer.add_scalar("PPO/Advantages_Normalized_Min", train_stats['ppo/advantages_normalized_min'], global_step)
+            
             if 'ppo/returns/mean' in train_stats:
                 self.tensorboard_writer.add_scalar("PPO/Returns_Mean", train_stats['ppo/returns/mean'].item(), global_step)
             if 'ppo/val/mean' in train_stats:
                 self.tensorboard_writer.add_scalar("PPO/Value_Mean", train_stats['ppo/val/mean'].item(), global_step)
             
-            # 学习率（如果可获取）
+            # Learning rate (if available)
             try:
                 current_lr = self.ppo_trainer.optimizer.param_groups[0]['lr']
                 self.tensorboard_writer.add_scalar("Training/Learning_Rate", current_lr, global_step)
             except:
                 pass
+            
+            # 🔧 New: 训练阶段标识
+            if self.config.critic_warmup_steps > 0:
+                is_warmup_phase = self.training_stats['nsteps'] < self.config.critic_warmup_steps
+                self.tensorboard_writer.add_scalar("Training/Is_Critic_Warmup_Phase", float(is_warmup_phase), global_step)
+                self.tensorboard_writer.add_scalar("Training/Warmup_Progress", 
+                                                 min(self.training_stats['nsteps'] / self.config.critic_warmup_steps, 1.0), global_step)
         
-        # 记录到CSV文件
+        # Record to CSV file
+        # 🔧 New: 添加训练阶段信息
+        training_phase = "warmup" if (self.config.critic_warmup_steps > 0 and 
+                                     self.training_stats['nsteps'] < self.config.critic_warmup_steps) else "joint"
+        
         csv_line = [
             datetime.datetime.now().strftime("%H:%M:%S"),
             str(self.config.run_id),
@@ -854,7 +1005,9 @@ class CodeTranslationTrainer:
             str(self.config.learning_rate),
             str(epoch),
             str(self.training_stats['nsteps']),
+            training_phase,  # 🔧 New: 训练阶段标识
             f"{avg_reward:.4f}",
+            f"{avg_reward_ref:.4f}",
             f"{avg_errors:.4f}",
             f"{avg_errors_ref:.4f}",
             f"{avg_nodes:.4f}",
@@ -865,84 +1018,160 @@ class CodeTranslationTrainer:
             str(train_stats['ppo/loss/policy'].item()),
             str(train_stats['ppo/loss/value'].item()),
             str(train_stats['ppo/policy/advantages_mean'].item()),
+            str(train_stats.get('ppo/advantages_raw_mean', 0.0)),
+            str(train_stats.get('ppo/advantages_raw_std', 0.0)),
+            str(train_stats.get('ppo/advantages_raw_max', 0.0)),
+            str(train_stats.get('ppo/advantages_raw_min', 0.0)),
+            str(train_stats.get('ppo/advantages_normalized_mean', 0.0)),
+            str(train_stats.get('ppo/advantages_normalized_std', 0.0)),
+            str(train_stats.get('ppo/advantages_normalized_max', 0.0)),
+            str(train_stats.get('ppo/advantages_normalized_min', 0.0)),
             str(train_stats['ppo/returns/mean'].item()),
             str(train_stats['ppo/val/mean'].item()),
             str(metrics['mean_rate']),
+            str(metrics['mean_rate_ref']),
             str(metrics['mean_ast_match']),
-            str(metrics['mean_dfg_match'])
+            str(metrics['mean_ast_match_ref']),
+            str(metrics['mean_dfg_match']),
+            str(metrics['mean_dfg_match_ref'])
         ]
         
         csv_file = self.results_dir / f"{self.config.source_lang}-{self.config.target_lang}.csv"
         with open(csv_file, 'a') as f:
             f.write(','.join(csv_line) + '\n')
             
-    def _save_checkpoint(self, epoch: int):
-        """保存检查点"""
-        model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
-        checkpoint_path = self.checkpoint_dir / f"pytorch_model_ep{epoch}.bin"
-        torch.save(model_to_save.state_dict(), checkpoint_path)
-        self.logger.info(f"模型已保存到: {checkpoint_path}")
+    def _save_checkpoint(self, epoch: int, save_type: str = "epoch", step: int = None):
+        """Save checkpoint with flexible naming and conditions - 与Qwen2.5-Coder保持一致"""
+        # Skip if this step was already saved
+        if step is not None and step == self.last_save_step:
+            return
+            
+        # Generate checkpoint directory name based on save type
+        if save_type == "epoch":
+            checkpoint_dir = self.checkpoint_dir / f"checkpoint-epoch-{epoch}"
+        elif save_type == "step":
+            checkpoint_dir = self.checkpoint_dir / f"checkpoint-step-{step}"
+        elif save_type == "best":
+            checkpoint_dir = self.checkpoint_dir / f"checkpoint-best-{self.config.save_metric}"
+        elif save_type == "emergency":
+            checkpoint_dir = self.checkpoint_dir / f"checkpoint-emergency-step-{step}"
+        else:
+            checkpoint_dir = self.checkpoint_dir / f"checkpoint-{save_type}-ep{epoch}-step{step}"
         
-        # 🔧 新增：清理旧检查点
+        # Create checkpoint directory
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        
+        # 🔧 修改：保存完整的模型目录，与Qwen2.5-Coder保持一致
+        try:
+            # 获取要保存的模型（处理DataParallel）
+            model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
+            
+            # 保存模型（使用Hugging Face的标准保存方式）
+            model_to_save.save_pretrained(checkpoint_dir)
+            
+            # 保存tokenizer
+            self.tokenizer.save_pretrained(checkpoint_dir)
+            
+            # 保存训练配置信息
+            config_info = {
+                "epoch": epoch,
+                "step": step,
+                "save_type": save_type,
+                "training_config": self.config.__dict__,
+                "model_path": str(self.config.model_path),
+                "save_time": datetime.datetime.now().isoformat()
+            }
+            
+            config_file = checkpoint_dir / "training_info.json"
+            with open(config_file, 'w', encoding='utf-8') as f:
+                json.dump(config_info, f, indent=2, ensure_ascii=False)
+            
+            # Update last save step
+            if step is not None:
+                self.last_save_step = step
+                
+            self.logger.info(f"✅ 完整模型保存到: {checkpoint_dir} (类型: {save_type})")
+            
+        except Exception as e:
+            self.logger.error(f"❌ 保存模型失败: {e}")
+            # 如果完整保存失败，尝试只保存权重作为备用
+            try:
+                model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
+                weights_path = checkpoint_dir / "pytorch_model.bin"
+                torch.save(model_to_save.state_dict(), weights_path)
+                self.logger.info(f"⚠️  备用权重保存到: {weights_path}")
+            except Exception as e2:
+                self.logger.error(f"❌ 备用保存也失败: {e2}")
+                return
+        
+        # 🔧 New: Clean up old checkpoints
         self._cleanup_old_checkpoints()
         
     def _cleanup_old_checkpoints(self):
-        """清理旧的检查点文件，只保留最新的N个"""
+        """Clean up old checkpoints, only keep the latest N - 适配新的目录保存方式"""
         if self.config.max_checkpoints <= 0:
-            return  # 不限制检查点数量
+            return  # Do not limit checkpoint number
             
-        # 获取所有检查点文件
-        checkpoint_pattern = "pytorch_model_ep*.bin"
-        checkpoint_files = list(self.checkpoint_dir.glob(checkpoint_pattern))
+        # Get all checkpoint directories
+        checkpoint_patterns = [
+            "checkpoint-epoch-*",
+            "checkpoint-step-*", 
+            "checkpoint-best-*",
+            "checkpoint-emergency-*"
+        ]
         
-        if len(checkpoint_files) <= self.config.max_checkpoints:
-            return  # 数量未超限
+        checkpoint_dirs = []
+        for pattern in checkpoint_patterns:
+            checkpoint_dirs.extend(list(self.checkpoint_dir.glob(pattern)))
+        
+        if len(checkpoint_dirs) <= self.config.max_checkpoints:
+            return  # Number not exceeded
             
-        # 按照修改时间排序（最新的在前）
-        checkpoint_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+        # Sort by modification time (latest first)
+        checkpoint_dirs.sort(key=lambda x: x.stat().st_mtime, reverse=True)
         
-        # 删除超出限制的旧文件
-        files_to_delete = checkpoint_files[self.config.max_checkpoints:]
+        # Delete old directories exceeding limit
+        dirs_to_delete = checkpoint_dirs[self.config.max_checkpoints:]
         
-        for file_path in files_to_delete:
+        for dir_path in dirs_to_delete:
             try:
-                file_path.unlink()
-                self.logger.info(f"删除旧检查点: {file_path}")
+                shutil.rmtree(dir_path)
+                self.logger.info(f"🗑️  删除旧checkpoint目录: {dir_path}")
             except Exception as e:
-                self.logger.warning(f"删除检查点失败 {file_path}: {e}")
+                self.logger.warning(f"⚠️  删除checkpoint目录失败 {dir_path}: {e}")
                 
-        if files_to_delete:
-            self.logger.info(f"已清理 {len(files_to_delete)} 个旧检查点，保留最新的 {self.config.max_checkpoints} 个")
+        if dirs_to_delete:
+            self.logger.info(f"🧹 清理了 {len(dirs_to_delete)} 个旧checkpoint目录，保留最新的 {self.config.max_checkpoints} 个")
                 
     def _evaluate(self, epoch: int):
-        """评估模型"""
+        """Evaluate model"""
         self.model.eval()
-        self.logger.info(f"开始第 {epoch} 轮评估")
+        self.logger.info(f"Starting epoch {epoch} evaluation")
         
-        # 训练集评估
+        # Train set evaluation
         train_errors, train_errors_ref = self._evaluate_dataset(
             epoch, self.train_features, self.train_dataloader, 'train'
         )
         self.model.train()
         
-            # 测试集评估
+        # Test set evaluation
         test_errors, test_errors_ref = self._evaluate_dataset(
             epoch, self.test_features, self.test_dataloader, 'test'
         )
         self.model.train()
         
-        self.logger.info(f"Epoch {epoch} 评估结果:")
-        self.logger.info(f"  训练集 - 模型错误: {train_errors}, 参考模型错误: {train_errors_ref}")
-        self.logger.info(f"  测试集 - 模型错误: {test_errors}, 参考模型错误: {test_errors_ref}")
+        self.logger.info(f"Epoch {epoch} evaluation results:")
+        self.logger.info(f"  Train - Model errors: {train_errors}, Ref model errors: {train_errors_ref}")
+        self.logger.info(f"  Test - Model errors: {test_errors}, Ref model errors: {test_errors_ref}")
         
-        # 🔧 新增：记录评估指标到 Tensorboard
+        # 🔧 New: Record evaluation metrics to Tensorboard
         if self.tensorboard_writer:
             self.tensorboard_writer.add_scalar("Evaluation/Train_Errors", train_errors, epoch)
             self.tensorboard_writer.add_scalar("Evaluation/Train_Errors_Ref", train_errors_ref, epoch)
             self.tensorboard_writer.add_scalar("Evaluation/Test_Errors", test_errors, epoch)
             self.tensorboard_writer.add_scalar("Evaluation/Test_Errors_Ref", test_errors_ref, epoch)
             
-            # 计算错误率
+            # Calculate error rate
             if len(self.train_features) > 0:
                 train_error_rate = train_errors / len(self.train_features)
                 self.tensorboard_writer.add_scalar("Evaluation/Train_Error_Rate", train_error_rate, epoch)
@@ -954,7 +1183,7 @@ class CodeTranslationTrainer:
             
     def _evaluate_dataset(self, epoch: int, features: List[InputFeatures], 
                          dataloader: DataLoader, prefix: str) -> Tuple[int, int]:
-        """评估数据集"""
+        """Evaluate dataset"""
         pred_ids = []
         pred_ids_ref = []
         indices = []
@@ -966,7 +1195,7 @@ class CodeTranslationTrainer:
                 batch = tuple(t.to(self.config.device) for t in batch)
                 source_ids, source_mask, target_ids, target_mask, ind = batch
                 
-                # 生成预测
+                # Generate predictions
                 full_preds = respond_to_batch(
                     self.model, source_ids, source_mask,
                     max_target_length=self.config.max_target_length,
@@ -983,37 +1212,33 @@ class CodeTranslationTrainer:
                 )
                 preds_ref = full_preds_ref[:, source_ids.size(1):]
                 
-                # 计算错误数
-                nerrors += sum(self.get_reward_func(
+                # Calculate number of errors
+                reward_result = self.get_reward_func(
                     lang=self.config.target_lang,
                     code_ids=preds,
                     code_ref_ids=preds_ref,
                     gold_ids=target_ids,
                     tokenizer=self.tokenizer
-                )[4])
+                )
+                nerrors += sum(reward_result[8])  # num_errors in the 8th position
                 
-                nerrors_ref += sum(self.get_reward_func(
-                    lang=self.config.target_lang,
-                    code_ids=preds_ref,
-                    code_ref_ids=preds_ref,
-                    gold_ids=target_ids,
-                    tokenizer=self.tokenizer
-                )[5])
+                # For ref errors, we can directly use the same result in num_errors_ref
+                nerrors_ref += sum(reward_result[9])  # num_errors_ref in the 9th position
                 
-                # 保存预测结果
+                # Save predictions
                 pred_ids.extend(list(preds.cpu().numpy()))
                 pred_ids_ref.extend(list(preds_ref.cpu().numpy()))
                 indices.extend(list(ind.cpu().numpy()))
                 
-        # 解码并保存结果
+        # Decode and save results
         self._save_predictions(epoch, prefix, pred_ids, pred_ids_ref, indices, features)
         
         return nerrors, nerrors_ref
         
     def _save_predictions(self, epoch: int, prefix: str, pred_ids: List, 
                          pred_ids_ref: List, indices: List, features: List[InputFeatures]):
-        """保存预测结果"""
-        # 解码预测结果
+        """Save predictions"""
+        # Decode predictions
         raw_predictions = [
             self.tokenizer.decode(id, skip_special_tokens=True, clean_up_tokenization_spaces=False)
             for id in pred_ids
@@ -1023,7 +1248,7 @@ class CodeTranslationTrainer:
             for id in pred_ids_ref
         ]
         
-        # 从Qwen响应中提取代码
+        # Extract code from Qwen response
         predictions = [
             extract_code_from_qwen_response(pred, self.config.target_lang)
             for pred in raw_predictions
@@ -1033,7 +1258,7 @@ class CodeTranslationTrainer:
             for pred in raw_predictions_ref
         ]
         
-        # 保存到文件
+        # Save to file
         model_file = self.checkpoint_dir / f"{prefix}.model_ep{epoch}"
         ref_file = self.checkpoint_dir / f"{prefix}.model_ref_ep{epoch}"
         gold_file = self.checkpoint_dir / f"{prefix}.gold_ep{epoch}"
@@ -1045,79 +1270,334 @@ class CodeTranslationTrainer:
             for pred, ref, i in zip(predictions, predictions_ref, indices):
                 f_model.write(pred + '\n')
                 f_ref.write(ref + '\n')
-                # 对于gold，也需要提取代码
+                # For gold, also extract code
                 gold_code = extract_code_from_qwen_response(features[i].target, self.config.target_lang)
                 f_gold.write(gold_code + '\n')
 
+    def _save_model_output_state(self, epoch: int, sample_idx: int, batch_idx: int, 
+                                source_ids: torch.Tensor, response_ids: torch.Tensor, 
+                                response_ids_ref: torch.Tensor, reward: torch.Tensor, metrics: Dict):
+        """保存模型输出状态到文件，用于调试和分析 - 每步都保存但每20步保存为一个文件"""
+        try:
+            # 🔧 修改：每步都保存，但每20步保存为一个文件
+            steps_per_file = 20
+            
+            # 创建输出目录
+            output_dir = Path(self.config.output_path) / "model_outputs"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            
+            # 计算当前应该保存到哪个文件
+            file_batch_idx = batch_idx // steps_per_file
+            step_in_file = batch_idx % steps_per_file
+            
+            # 创建文件名 - 每20步一个文件
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"model_output_ep{epoch}_sample{sample_idx}_batch{file_batch_idx*steps_per_file}-{(file_batch_idx+1)*steps_per_file-1}_{timestamp}.json"
+            filepath = output_dir / filename
+            
+            # 检查是否需要创建新文件或追加到现有文件
+            if step_in_file == 0:
+                # 新文件，创建完整的输出数据结构
+                output_data = {
+                    "metadata": {
+                        "epoch": epoch,
+                        "sample_idx": sample_idx,
+                        "file_batch_range": f"{file_batch_idx*steps_per_file}-{(file_batch_idx+1)*steps_per_file-1}",
+                        "timestamp": timestamp,
+                        "run_id": self.config.run_id,
+                        "source_lang": self.config.source_lang,
+                        "target_lang": self.config.target_lang,
+                        "steps_per_file": steps_per_file,
+                        "total_steps_in_file": 0
+                    },
+                    "steps": []
+                }
+            else:
+                # 追加到现有文件
+                try:
+                    with open(filepath, 'r', encoding='utf-8') as f:
+                        output_data = json.load(f)
+                except (FileNotFoundError, json.JSONDecodeError):
+                    # 如果文件不存在或损坏，创建新的
+                    output_data = {
+                        "metadata": {
+                            "epoch": epoch,
+                            "sample_idx": sample_idx,
+                            "file_batch_range": f"{file_batch_idx*steps_per_file}-{(file_batch_idx+1)*steps_per_file-1}",
+                            "timestamp": timestamp,
+                            "run_id": self.config.run_id,
+                            "source_lang": self.config.source_lang,
+                            "target_lang": self.config.target_lang,
+                            "steps_per_file": steps_per_file,
+                            "total_steps_in_file": 0
+                        },
+                        "steps": []
+                    }
+            
+            # 解码token序列为文本
+            source_texts = []
+            response_texts = []
+            response_ref_texts = []
+            
+            for i in range(source_ids.shape[0]):
+                # 解码source_ids（去掉padding）
+                source_tokens = source_ids[i].cpu().numpy()
+                source_text = self.tokenizer.decode(source_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                source_texts.append(source_text)
+                
+                # 解码response_ids
+                response_tokens = response_ids[i].cpu().numpy()
+                response_text = self.tokenizer.decode(response_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                response_texts.append(response_text)
+                
+                # 解码response_ids_ref
+                response_ref_tokens = response_ids_ref[i].cpu().numpy()
+                response_ref_text = self.tokenizer.decode(response_ref_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                response_ref_texts.append(response_ref_text)
+            
+            # 提取代码块
+            extracted_codes = [extract_code_from_qwen_response(text, self.config.target_lang) for text in response_texts]
+            extracted_codes_ref = [extract_code_from_qwen_response(text, self.config.target_lang) for text in response_ref_texts]
+            
+            # 🔧 修改：准备当前步骤的数据
+            step_timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            step_data = {
+                "step_info": {
+                    "batch_idx": batch_idx,
+                    "step_in_file": step_in_file,
+                    "timestamp": step_timestamp,
+                    "batch_size": source_ids.shape[0],
+                    "source_length": source_ids.shape[1],
+                    "response_length": response_ids.shape[1],
+                    "response_ref_length": response_ids_ref.shape[1]
+                },
+                "rewards": {
+                    "reward_values": reward.cpu().numpy().tolist(),
+                    "mean_reward": float(reward.mean().cpu().numpy().item()),
+                    "total_reward": float(reward.sum().cpu().numpy().item())
+                },
+                "metrics": {
+                    "mean_rate": float(metrics['mean_rate']) if isinstance(metrics['mean_rate'], (int, float, np.number)) else float(metrics['mean_rate'].item()),
+                    "mean_ast_match": float(metrics['mean_ast_match']) if isinstance(metrics['mean_ast_match'], (int, float, np.number)) else float(metrics['mean_ast_match'].item()),
+                    "mean_dfg_match": float(metrics['mean_dfg_match']) if isinstance(metrics['mean_dfg_match'], (int, float, np.number)) else float(metrics['mean_dfg_match'].item()),
+                    "mean_rate_ref": float(metrics['mean_rate_ref']) if isinstance(metrics['mean_rate_ref'], (int, float, np.number)) else float(metrics['mean_rate_ref'].item()),
+                    "mean_ast_match_ref": float(metrics['mean_ast_match_ref']) if isinstance(metrics['mean_ast_match_ref'], (int, float, np.number)) else float(metrics['mean_ast_match_ref'].item()),
+                    "mean_dfg_match_ref": float(metrics['mean_dfg_match_ref']) if isinstance(metrics['mean_dfg_match_ref'], (int, float, np.number)) else float(metrics['mean_dfg_match_ref'].item()),
+                    "num_errors": metrics['num_errors'],
+                    "num_errors_ref": metrics['num_errors_ref'],
+                    "num_nodes": metrics['num_nodes'],
+                    "num_nodes_ref": metrics['num_nodes_ref']
+                },
+                "samples": []
+            }
+            
+            # 为每个样本添加详细信息
+            for i in range(source_ids.shape[0]):
+                # 安全地获取reward值
+                if reward.shape[0] > i:
+                    reward_value = float(reward[i].cpu().numpy().item()) if reward[i].numel() == 1 else float(reward[i].mean().cpu().numpy().item())
+                else:
+                    reward_value = 0.0
+                
+                # 获取每个样本的具体编译成功信息
+                sample_details = metrics.get('sample_details', {})
+                compilation_success = sample_details.get('compilation_success', [False] * source_ids.shape[0])
+                ast_match = sample_details.get('ast_match', [0.0] * source_ids.shape[0])
+                dfg_match = sample_details.get('dfg_match', [0.0] * source_ids.shape[0])
+                compilation_success_ref = sample_details.get('compilation_success_ref', [False] * source_ids.shape[0])
+                ast_match_ref = sample_details.get('ast_match_ref', [0.0] * source_ids.shape[0])
+                dfg_match_ref = sample_details.get('dfg_match_ref', [0.0] * source_ids.shape[0])
+                
+                sample_data = {
+                    "sample_id": i,
+                    "source": {
+                        "text": source_texts[i],
+                        "length": len(source_ids[i])
+                    },
+                    "response": {
+                        "text": response_texts[i],
+                        "length": len(response_ids[i]),
+                        "extracted_code": extracted_codes[i],
+                        "code_length": len(extracted_codes[i])
+                    },
+                    "response_ref": {
+                        "text": response_ref_texts[i],
+                        "length": len(response_ids_ref[i]),
+                        "extracted_code": extracted_codes_ref[i],
+                        "code_length": len(extracted_codes_ref[i])
+                    },
+                    "reward": {
+                        "value": reward_value,
+                        "compilation_success": compilation_success[i] if i < len(compilation_success) else False,
+                        "ast_match": ast_match[i] if i < len(ast_match) else 0.0,
+                        "dfg_match": dfg_match[i] if i < len(dfg_match) else 0.0
+                    },
+                    "reward_ref": {
+                        "compilation_success": compilation_success_ref[i] if i < len(compilation_success_ref) else False,
+                        "ast_match": ast_match_ref[i] if i < len(ast_match_ref) else 0.0,
+                        "dfg_match": dfg_match_ref[i] if i < len(dfg_match_ref) else 0.0
+                    }
+                }
+                step_data["samples"].append(sample_data)
+            
+            # 🔧 修改：将当前步骤添加到输出数据中
+            output_data["steps"].append(step_data)
+            output_data["metadata"]["total_steps_in_file"] = len(output_data["steps"])
+            
+            # 保存到文件
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(output_data, f, indent=2, ensure_ascii=False)
+            
+            # 🔧 修改：同时创建一个简化的日志文件，记录关键信息
+            log_filename = f"model_output_summary_ep{epoch}_sample{sample_idx}_batch{file_batch_idx*steps_per_file}-{(file_batch_idx+1)*steps_per_file-1}.txt"
+            log_filepath = output_dir / log_filename
+            
+            with open(log_filepath, 'a', encoding='utf-8') as f:
+                f.write(f"=== Step {step_in_file+1}/{steps_per_file} (Batch {batch_idx}) at {step_timestamp} ===\n")
+                f.write(f"Mean Reward: {step_data['rewards']['mean_reward']:.4f}\n")
+                f.write(f"Compilation Rate: {step_data['metrics']['mean_rate']:.4f}\n")
+                f.write(f"AST Match: {step_data['metrics']['mean_ast_match']:.4f}\n")
+                f.write(f"DFG Match: {step_data['metrics']['mean_dfg_match']:.4f}\n")
+                f.write(f"Errors: {sum(step_data['metrics']['num_errors'])}\n")
+                f.write(f"Nodes: {sum(step_data['metrics']['num_nodes'])}\n")
+                f.write("-" * 50 + "\n")
+                
+                # 为每个样本添加简要信息
+                for i, sample in enumerate(step_data["samples"]):
+                    f.write(f"Sample {i}:\n")
+                    f.write(f"  Source length: {sample['source']['length']} tokens\n")
+                    f.write(f"  Response length: {sample['response']['length']} tokens\n")
+                    f.write(f"  Extracted code length: {sample['response']['code_length']} chars\n")
+                    f.write(f"  Reward: {sample['reward']['value']:.4f}\n")
+                    f.write(f"  Compilation: {'✅' if sample['reward']['compilation_success'] else '❌'}\n")
+                    f.write(f"  AST Match: {sample['reward']['ast_match']:.4f}\n")
+                    f.write(f"  DFG Match: {sample['reward']['dfg_match']:.4f}\n")
+                    f.write(f"  Ref Compilation: {'✅' if sample['reward_ref']['compilation_success'] else '❌'}\n")
+                    f.write(f"  Code preview: {sample['response']['extracted_code'][:100]}...\n")
+                    f.write("\n")
+            
+            # 🔧 修改：记录到日志，每20步记录一次
+            if step_in_file == 0:  # 每20步记录一次，避免日志过多
+                self.logger.info(f"📝 模型输出状态已保存: {filename} (包含20个步骤)")
+            else:
+                self.logger.debug(f"📝 步骤 {step_in_file+1}/20 已添加到文件: {filename}")
+                
+        except Exception as e:
+            self.logger.warning(f"⚠️  保存模型输出状态失败: {e}")
+            # 不抛出异常，避免影响训练流程
+
+    def _should_save_best_model(self, metrics: Dict) -> bool:
+        """Check if we should save the best model based on performance metrics"""
+        if not self.config.save_best_only:
+            return False
+            
+        current_metric = self.config.save_metric
+        if current_metric not in metrics:
+            self.logger.warning(f"Save metric '{current_metric}' not found in metrics: {list(metrics.keys())}")
+            return False
+            
+        current_value = metrics[current_metric]
+        best_value = self.best_metrics[current_metric]
+        
+        # Check if current performance is better than best
+        improvement = current_value - best_value
+        if improvement > self.config.save_threshold:
+            self.best_metrics[current_metric] = current_value
+            self.logger.info(f"New best {current_metric}: {current_value:.4f} (improvement: {improvement:.4f})")
+            return True
+            
+        return False
+
 
 def parse_args():
-    """解析命令行参数"""
-    parser = argparse.ArgumentParser(description="Qwen2.5-Coder PPO代码生成训练程序")
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description="Qwen2.5-Coder PPO code generation training program")
     
-    # 必需参数
+    # Required arguments
     parser.add_argument("--source_lang", required=True, type=str,
-                       help="源代码语言")
+                       help="Source code language")
     parser.add_argument("--target_lang", required=True, type=str,
-                       help="目标代码语言")
+                       help="Target code language")
     parser.add_argument("--model_path", required=True, type=str,
-                       help="Qwen2.5-Coder模型路径")
+                       help="Qwen2.5-Coder model path")
     parser.add_argument("--data_path", required=True, type=str,
-                       help="Qwen格式数据目录路径")
+                       help="Qwen format data directory path")
     parser.add_argument("--output_path", required=True, type=str,
-                       help="输出目录路径")
+                       help="Output directory path")
     
-    # 可选参数
+    # Optional arguments
     parser.add_argument("--max_source_length", default=400, type=int,
-                       help="最大源代码长度")
+                       help="Maximum source code length")
     parser.add_argument("--max_target_length", default=400, type=int,
-                       help="最大目标代码长度")
+                       help="Maximum target code length")
     parser.add_argument("--train_batch_size", default=16, type=int,
-                       help="训练批次大小")
+                       help="Training batch size")
     parser.add_argument("--test_batch_size", default=48, type=int,
-                       help="测试批次大小")
+                       help="Test batch size")
+    parser.add_argument("--minibatch_size", default=1, type=int,
+                       help="Minibatch size")
+    parser.add_argument("--gradient_accumulation_steps", default=4, type=int,
+                       help="Gradient accumulation steps (default: 4, effective_batch = train_batch_size * gradient_accumulation_steps)")
+    parser.add_argument("--critic_warmup_steps", default=0, type=int,
+                       help="Critic warmup steps - train only critic for N steps before joint training (default: 0, recommended: 50-100)")
     parser.add_argument("--train_epochs", default=1000000, type=int,
-                       help="训练轮数")
+                       help="Training epochs")
     parser.add_argument("--learning_rate", type=float, default=1e-5,
-                       help="学习率")
+                       help="Learning rate")
     parser.add_argument("--kl_coef", type=float, default=0.05,
-                       help="KL系数")
+                       help="KL coefficient")
     parser.add_argument("--kl_target", type=float, default=1.0,
-                       help="KL目标值")
+                       help="KL target value")
     parser.add_argument("--vf_coef", type=float, default=1e-3,
-                       help="价值函数系数")
+                       help="Value function coefficient")
     parser.add_argument("--action_space", default=2, type=int,
-                       help="动作空间大小（top_k）")
+                       help="Action space size (top_k)")
     parser.add_argument("--num_syn_samples", default=5, type=int,
-                       help="每轮采样次数")
+                       help="Number of samples per epoch")
     parser.add_argument("--run_id", default=1, type=int,
-                       help="运行ID")
+                       help="Run ID")
     parser.add_argument("--seed", default=42, type=int,
-                       help="随机种子")
+                       help="Random seed")
     
-    # 🔧 新增：检查点保存控制参数
-    parser.add_argument("--save_steps", default=1, type=int,
-                       help="每N轮保存一次检查点（默认每轮都保存）")
+    # 🔧 New: Checkpoint saving control parameters
+    parser.add_argument("--save_every_n_steps", default=0, type=int,
+                       help="Save checkpoint every N training steps (0 means disabled, default: 0)")
     parser.add_argument("--max_checkpoints", default=10, type=int,
-                       help="最多保留N个检查点，0表示不限制（默认保留10个）")
+                       help="Maximum number of checkpoints to retain (default: 10)")
     
-    # 🔧 新增：Tensorboard 支持参数
+    # 🔧 New: Performance-based saving parameters
+    parser.add_argument("--save_best_only", action="store_true", default=False,
+                       help="Only save when performance improves (default: False)")
+    parser.add_argument("--save_metric", default="reward", type=str,
+                       choices=["reward", "compilation_rate", "ast_match", "dfg_match"],
+                       help="Metric to track for best model saving (default: reward)")
+    parser.add_argument("--save_threshold", default=0.0, type=float,
+                       help="Minimum improvement threshold for saving (default: 0.0)")
+    
+    # 🔧 New: Emergency saving parameter
+    parser.add_argument("--save_on_error", action="store_true", default=True,
+                       help="Save checkpoint when training error occurs (default: True)")
+    parser.add_argument("--no_save_on_error", action="store_false", dest="save_on_error",
+                       help="Disable emergency saving on error")
+    
+    # 🔧 New: Tensorboard support parameters
     parser.add_argument("--use_tensorboard", action="store_true", default=True,
-                       help="启用Tensorboard日志记录（默认启用）")
+                       help="Enable Tensorboard logging (default: enabled)")
     parser.add_argument("--no_tensorboard", action="store_false", dest="use_tensorboard",
-                       help="禁用Tensorboard日志记录")
+                       help="Disable Tensorboard logging")
     parser.add_argument("--tensorboard_log_dir", default=None, type=str,
-                       help="Tensorboard日志目录（默认为output_path/tensorboard）")
+                       help="Tensorboard log directory (default: output_path/tensorboard)")
     parser.add_argument("--log_every_n_steps", default=1, type=int,
-                       help="每N个训练步骤记录一次指标到Tensorboard（默认每步都记录）")
+                       help="Record metrics to Tensorboard every N training steps (default: every step)")
     
     return parser.parse_args()
 
 
 def main():
-    """主函数"""
+    """Main function"""
     args = parse_args()
     
-    # 创建配置对象
+    # Create configuration object
     config = TrainingConfig(
         source_lang=args.source_lang,
         target_lang=args.target_lang,
@@ -1128,6 +1608,9 @@ def main():
         max_target_length=args.max_target_length,
         train_batch_size=args.train_batch_size,
         test_batch_size=args.test_batch_size,
+        minibatch_size=args.minibatch_size,
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        critic_warmup_steps=args.critic_warmup_steps,
         train_epochs=args.train_epochs,
         learning_rate=args.learning_rate,
         kl_coef=args.kl_coef,
@@ -1137,25 +1620,29 @@ def main():
         num_syn_samples=args.num_syn_samples,
         run_id=args.run_id,
         seed=args.seed,
-        save_steps=args.save_steps,
+        save_every_n_steps=args.save_every_n_steps,
         max_checkpoints=args.max_checkpoints,
+        save_best_only=args.save_best_only,
+        save_metric=args.save_metric,
+        save_threshold=args.save_threshold,
+        save_on_error=args.save_on_error,
         use_tensorboard=args.use_tensorboard,
         tensorboard_log_dir=args.tensorboard_log_dir,
         log_every_n_steps=args.log_every_n_steps
     )
     
     print("=" * 60)
-    print("🚀 Qwen2.5-Coder PPO代码翻译训练程序")
+    print("🚀 Qwen2.5-Coder PPO code translation training program")
     print("=" * 60)
-    print(f"📝 源语言: {config.source_lang}")
-    print(f"🎯 目标语言: {config.target_lang}")
-    print(f"🤖 模型路径: {config.model_path}")
-    print(f"📂 数据路径: {config.data_path}")
-    print(f"💾 输出路径: {config.output_path}")
-    print(f"🔧 设备: {config.device}")
+    print(f"📝 Source language: {config.source_lang}")
+    print(f"🎯 Target language: {config.target_lang}")
+    print(f"🤖 Model path: {config.model_path}")
+    print(f"📂 Data path: {config.data_path}")
+    print(f"💾 Output path: {config.output_path}")
+    print(f"🔧 Device: {config.device}")
     print("=" * 60)
     
-    # 创建训练器并开始训练
+    # Create trainer and start training
     trainer = CodeTranslationTrainer(config)
     trainer.train()
 

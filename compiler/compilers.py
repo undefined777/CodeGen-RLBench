@@ -43,10 +43,13 @@ def compile_prog(filepath, lang):
     else:
         print('invalid argument')
         return
-    proc = subprocess.Popen(cmd, stdout=PIPE, stderr=PIPE,shell=True)
-    error = [i.decode('utf-8') for i in proc.stderr.readlines()]
+    proc = subprocess.Popen(cmd, stdout=PIPE, stderr=PIPE, shell=True)
+    
+    # 使用更健壮的编码处理，直接使用errors='replace'处理非UTF-8字符
+    error = [i.decode('utf-8', errors='replace') for i in proc.stderr.readlines()]
+    output = [i.decode('utf-8', errors='replace') for i in proc.stdout.readlines()]
+    
     err = '\n'.join(error)
-    output = [i.decode('utf-8') for i in proc.stdout.readlines()]
     op = '\n'.join(output)
     return err, op
 

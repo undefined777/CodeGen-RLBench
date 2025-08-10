@@ -1,82 +1,88 @@
 #!/bin/bash
 
 
-set -e  # 遇到错误立即退出
+set -e  # Exit on error
 
 
-# 📁 路径配置 - 请根据实际情况修改
+# 📁 Path configuration - Please modify according to actual situation
 MODEL_PATH="/home/cxy/Qwen2.5-Coder/finetuning/sft/checkpoints/qwen0.5b-lr5e-5-wr10-wd0.0-bsz1024-maxlen1280"
 DATA_PATH="data"
 OUTPUT_PATH="./outputs"
 TENSORBOARD_DIR="${OUTPUT_PATH}/tensorboard"
 
-# 🎛️ A100优化训练参数
+# 🎛️ A100 optimization training parameters
 SOURCE_LANG="java"
 TARGET_LANG="cpp"
-TRAIN_BATCH_SIZE=4        # A100可以支持更大的batch size
-TEST_BATCH_SIZE=4         # 测试时可以用更大的batch
-MAX_SOURCE_LENGTH=400      # 适当增加序列长度
-MAX_TARGET_LENGTH=400
-LEARNING_RATE=1.5e-5       # 稍微增大学习率配合大batch size
-TRAIN_EPOCHS=1000000       # 大量训练轮次
-KL_COEF=0.05              # KL散度系数
-VF_COEF=1e-3              # 价值函数系数
-SAVE_STEPS=5              # 每5个epoch保存一次
-MAX_CHECKPOINTS=20        # A100有大存储，可以保留更多检查点
+TRAIN_BATCH_SIZE=8        # A100 can support larger batch size
+TEST_BATCH_SIZE=1         # Test with larger batch
+MAX_SOURCE_LENGTH=700      # Increase sequence length
+MAX_TARGET_LENGTH=700
+LEARNING_RATE=5e-6        # 降低学习率，避免梯度爆炸
+TRAIN_EPOCHS=10       # Large number of training epochs
+KL_COEF=0.1               # 增加KL系数，加强参考模型约束
+VF_COEF=1e-3              # Value function coefficient
+SAVE_EVERY_N_STEPS=100    # Save every 100 training steps
+MAX_CHECKPOINTS=20        # A100 has large storage, can retain more checkpoints
+MINIBATCH_SIZE=1          # 保持为1，通过梯度累积模拟更大batch
+GRADIENT_ACCUMULATION_STEPS=4  # 4步累积 = 有效batch为16/4=4次更新
+CRITIC_WARMUP_STEPS=50    # Critic预热步数，让价值网络先稳定
 
-# 🔍 创建输出目录
+# 🔍 Create output directory
 echo "📁 创建输出目录: ${OUTPUT_PATH}"
 mkdir -p "${OUTPUT_PATH}"
 mkdir -p "${TENSORBOARD_DIR}"
 
-# 📝 保存配置信息
+# 📝 Save configuration information
 CONFIG_FILE="${OUTPUT_PATH}/training_config.txt"
 cat > "${CONFIG_FILE}" << EOF
 =============================================================================
-A100 训练配置信息
+A100 training configuration information
 =============================================================================
-训练开始时间: $(date)
-GPU信息: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits)
-CUDA版本: $(nvcc --version | grep "release" | awk '{print $5,$6}')
-PyTorch版本: $(python -c "import torch; print(torch.__version__)")
+Training start time: $(date)
+GPU information: $(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits)
+CUDA version: $(nvcc --version | grep "release" | awk '{print $5,$6}')
+PyTorch version: $(python -c "import torch; print(torch.__version__)")
 
-模型配置:
-- 模型路径: ${MODEL_PATH}
-- 源语言: ${SOURCE_LANG}
-- 目标语言: ${TARGET_LANG}
+Model configuration:
+- Model path: ${MODEL_PATH}
+- Source language: ${SOURCE_LANG}
+- Target language: ${TARGET_LANG}
 
-训练参数:
-- 训练批次大小: ${TRAIN_BATCH_SIZE}
-- 测试批次大小: ${TEST_BATCH_SIZE}
-- 最大源序列长度: ${MAX_SOURCE_LENGTH}
-- 最大目标序列长度: ${MAX_TARGET_LENGTH}
-- 学习率: ${LEARNING_RATE}
-- 训练轮次: ${TRAIN_EPOCHS}
-- KL系数: ${KL_COEF}
-- 价值函数系数: ${VF_COEF}
-- 保存间隔: ${SAVE_STEPS} epochs
-- 最大检查点数: ${MAX_CHECKPOINTS}
+Training parameters:
+- Training batch size: ${TRAIN_BATCH_SIZE}
+- Test batch size: ${TEST_BATCH_SIZE}
+- Maximum source sequence length: ${MAX_SOURCE_LENGTH}
+- Maximum target sequence length: ${MAX_TARGET_LENGTH}
+- Learning rate: ${LEARNING_RATE}
+- Training epochs: ${TRAIN_EPOCHS}
+- KL coefficient: ${KL_COEF}
+- Value function coefficient: ${VF_COEF}
+- Minibatch size: ${MINIBATCH_SIZE}
+- Gradient accumulation steps: ${GRADIENT_ACCUMULATION_STEPS}
+- Critic warmup steps: ${CRITIC_WARMUP_STEPS}
+- Save interval: ${SAVE_EVERY_N_STEPS} training steps
+- Maximum checkpoints: ${MAX_CHECKPOINTS}
 
-输出路径: ${OUTPUT_PATH}
-Tensorboard路径: ${TENSORBOARD_DIR}
+Output path: ${OUTPUT_PATH}
+Tensorboard path: ${TENSORBOARD_DIR}
 =============================================================================
 EOF
 
-echo "📊 训练配置信息已保存到: ${CONFIG_FILE}"
+echo "📊 Training configuration information saved to: ${CONFIG_FILE}"
 cat "${CONFIG_FILE}"
 
-# 🚀 检查GPU状态
+# 🚀 Check GPU status
 echo ""
-echo "🔍 GPU状态检查:"
+echo "🔍 GPU status check:"
 nvidia-smi
 
-# 🎯 启动训练
+# 🎯 Start training
 echo ""
-echo "🚀 开始A100优化训练..."
-echo "📈 Tensorboard监控: tensorboard --logdir=${TENSORBOARD_DIR} --port=6006"
+echo "🚀 Start A100 optimization training..."
+echo "📈 Tensorboard monitoring: tensorboard --logdir=${TENSORBOARD_DIR} --port=6006"
 echo ""
 
-# 使用nohup在后台运行，输出重定向到日志文件
+# Use nohup to run in the background, redirect output to log file
 python optimized_rl_trainer.py \
   --source_lang "${SOURCE_LANG}" \
   --target_lang "${TARGET_LANG}" \
@@ -91,9 +97,12 @@ python optimized_rl_trainer.py \
   --learning_rate ${LEARNING_RATE} \
   --kl_coef ${KL_COEF} \
   --vf_coef ${VF_COEF} \
-  --save_steps ${SAVE_STEPS} \
+  --save_every_n_steps ${SAVE_EVERY_N_STEPS} \
+  --minibatch_size ${MINIBATCH_SIZE} \
+  --gradient_accumulation_steps ${GRADIENT_ACCUMULATION_STEPS} \
+  --critic_warmup_steps ${CRITIC_WARMUP_STEPS} \
   --max_checkpoints ${MAX_CHECKPOINTS} \
   --use_tensorboard \
   --tensorboard_log_dir "${TENSORBOARD_DIR}" \
   --log_every_n_steps 1 \
-  --seed 42 \
+  --seed 44

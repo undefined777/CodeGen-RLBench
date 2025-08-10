@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-简化的训练启动脚本
+Simplified training launch script
 
-使用方法：
+Usage:
 python run_training.py --source_lang python --target_lang java --model_path ./models/codet5-base --data_path ./data --output_path ./outputs
 
-或者使用配置文件：
+Or use configuration file:
 python run_training.py --config config.json
 """
 
@@ -18,7 +18,7 @@ from optimized_rl_trainer import CodeTranslationTrainer, TrainingConfig
 
 
 def load_config_from_file(config_path: str) -> TrainingConfig:
-    """从配置文件加载配置"""
+    """Load configuration from configuration file"""
     with open(config_path, 'r', encoding='utf-8') as f:
         config_data = json.load(f)
     
@@ -47,73 +47,73 @@ def load_config_from_file(config_path: str) -> TrainingConfig:
 
 
 def validate_config(config: TrainingConfig):
-    """验证配置的有效性"""
-    # 检查必需的文件和目录
+    """Validate configuration validity"""
+    # Check required files and directories
     if not Path(config.model_path).exists():
-        raise FileNotFoundError(f"模型路径不存在: {config.model_path}")
+        raise FileNotFoundError(f"Model path does not exist: {config.model_path}")
     
     if not Path(config.data_path).exists():
-        raise FileNotFoundError(f"数据路径不存在: {config.data_path}")
+        raise FileNotFoundError(f"Data path does not exist: {config.data_path}")
     
-    # 检查支持的语言
+    # Check supported languages
     supported_langs = ['python', 'java', 'cpp', 'c', 'javascript', 'php', 'c_sharp']
     if config.source_lang not in supported_langs:
-        raise ValueError(f"不支持的源代码语言: {config.source_lang}")
+        raise ValueError(f"Unsupported source code language: {config.source_lang}")
     if config.target_lang not in supported_langs:
-        raise ValueError(f"不支持的目标代码语言: {config.target_lang}")
+        raise ValueError(f"Unsupported target code language: {config.target_lang}")
     
-    # 检查参数范围
+    # Check parameter range
     if config.learning_rate <= 0:
-        raise ValueError(f"学习率必须大于0: {config.learning_rate}")
+        raise ValueError(f"Learning rate must be greater than 0: {config.learning_rate}")
     if config.train_batch_size <= 0:
-        raise ValueError(f"训练批次大小必须大于0: {config.train_batch_size}")
+        raise ValueError(f"Training batch size must be greater than 0: {config.train_batch_size}")
     if config.train_epochs <= 0:
-        raise ValueError(f"训练轮数必须大于0: {config.train_epochs}")
+        raise ValueError(f"Training epochs must be greater than 0: {config.train_epochs}")
 
 
 def main():
-    """主函数"""
-    parser = argparse.ArgumentParser(description="PPO代码生成训练启动脚本")
+    """Main function"""
+    parser = argparse.ArgumentParser(description="PPO code generation training launch script")
     
-    # 添加配置选项
-    parser.add_argument("--config", type=str, help="配置文件路径")
+    # Add configuration options
+    parser.add_argument("--config", type=str, help="Configuration file path")
     
-    # 添加命令行参数（当不使用配置文件时）
-    parser.add_argument("--source_lang", type=str, help="源代码语言")
-    parser.add_argument("--target_lang", type=str, help="目标代码语言")
-    parser.add_argument("--model_path", type=str, help="预训练模型路径")
-    parser.add_argument("--data_path", type=str, help="数据目录路径")
-    parser.add_argument("--output_path", type=str, help="输出目录路径")
+    # Add command line arguments (when not using configuration file)
+    parser.add_argument("--source_lang", type=str, help="Source code language")
+    parser.add_argument("--target_lang", type=str, help="Target code language")
+    parser.add_argument("--model_path", type=str, help="Pre-trained model path")
+    parser.add_argument("--data_path", type=str, help="Data directory path")
+    parser.add_argument("--output_path", type=str, help="Output directory path")
     
-    # 可选参数
-    parser.add_argument("--max_source_length", type=int, default=400, help="最大源代码长度")
-    parser.add_argument("--max_target_length", type=int, default=400, help="最大目标代码长度")
-    parser.add_argument("--train_batch_size", type=int, default=16, help="训练批次大小")
-    parser.add_argument("--test_batch_size", type=int, default=48, help="测试批次大小")
-    parser.add_argument("--train_epochs", type=int, default=1000000, help="训练轮数")
-    parser.add_argument("--learning_rate", type=float, default=1e-5, help="学习率")
-    parser.add_argument("--kl_coef", type=float, default=0.05, help="KL系数")
-    parser.add_argument("--kl_target", type=float, default=1.0, help="KL目标值")
-    parser.add_argument("--vf_coef", type=float, default=1e-3, help="价值函数系数")
-    parser.add_argument("--action_space", type=int, default=2, help="动作空间大小")
-    parser.add_argument("--num_syn_samples", type=int, default=5, help="每轮采样次数")
-    parser.add_argument("--run_id", type=int, default=1, help="运行ID")
-    parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    # Optional parameters
+    parser.add_argument("--max_source_length", type=int, default=400, help="Maximum source code length")
+    parser.add_argument("--max_target_length", type=int, default=400, help="Maximum target code length")
+    parser.add_argument("--train_batch_size", type=int, default=16, help="Training batch size")
+    parser.add_argument("--test_batch_size", type=int, default=48, help="Test batch size")
+    parser.add_argument("--train_epochs", type=int, default=1000000, help="Training epochs")
+    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate")
+    parser.add_argument("--kl_coef", type=float, default=0.05, help="KL coefficient")
+    parser.add_argument("--kl_target", type=float, default=1.0, help="KL target value")
+    parser.add_argument("--vf_coef", type=float, default=1e-3, help="Value function coefficient")
+    parser.add_argument("--action_space", type=int, default=2, help="Action space size")
+    parser.add_argument("--num_syn_samples", type=int, default=5, help="Number of samples per epoch")
+    parser.add_argument("--run_id", type=int, default=1, help="Run ID")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     
     args = parser.parse_args()
     
-    # 加载配置
+    # Load configuration
     if args.config:
-        # 从配置文件加载
+        # Load from configuration file
         config = load_config_from_file(args.config)
-        print(f"从配置文件加载配置: {args.config}")
+        print(f"Loaded configuration from: {args.config}")
     else:
-        # 从命令行参数创建配置
+        # Create configuration from command line arguments
         if not all([args.source_lang, args.target_lang, args.model_path, args.data_path, args.output_path]):
-            print("错误：当不使用配置文件时，必须提供所有必需参数")
-            print("使用方法：")
+            print("Error: When not using configuration file, all required parameters must be provided")
+            print("Usage:")
             print("  python run_training.py --config config.json")
-            print("  或者")
+            print("  or")
             print("  python run_training.py --source_lang python --target_lang java --model_path ./models/codet5-base --data_path ./data --output_path ./outputs")
             sys.exit(1)
         
@@ -138,46 +138,46 @@ def main():
             seed=args.seed
         )
     
-    # 验证配置
+    # Validate configuration
     try:
         validate_config(config)
     except Exception as e:
-        print(f"配置验证失败: {e}")
+        print(f"Configuration validation failed: {e}")
         sys.exit(1)
     
-    # 创建输出目录
+    # Create output directory
     Path(config.output_path).mkdir(parents=True, exist_ok=True)
     
-    # 打印配置信息
+    # Print configuration information
     print("=" * 60)
-    print("PPO代码生成训练配置")
+    print("PPO code generation training configuration")
     print("=" * 60)
-    print(f"源代码语言: {config.source_lang}")
-    print(f"目标代码语言: {config.target_lang}")
-    print(f"模型路径: {config.model_path}")
-    print(f"数据路径: {config.data_path}")
-    print(f"输出路径: {config.output_path}")
-    print(f"训练批次大小: {config.train_batch_size}")
-    print(f"测试批次大小: {config.test_batch_size}")
-    print(f"训练轮数: {config.train_epochs}")
-    print(f"学习率: {config.learning_rate}")
-    print(f"KL系数: {config.kl_coef}")
-    print(f"KL目标值: {config.kl_target}")
-    print(f"价值函数系数: {config.vf_coef}")
-    print(f"动作空间大小: {config.action_space}")
-    print(f"每轮采样次数: {config.num_syn_samples}")
-    print(f"运行ID: {config.run_id}")
-    print(f"随机种子: {config.seed}")
+    print(f"Source code language: {config.source_lang}")
+    print(f"Target code language: {config.target_lang}")
+    print(f"Model path: {config.model_path}")
+    print(f"Data path: {config.data_path}")
+    print(f"Output path: {config.output_path}")
+    print(f"Training batch size: {config.train_batch_size}")
+    print(f"Test batch size: {config.test_batch_size}")
+    print(f"Training epochs: {config.train_epochs}")
+    print(f"Learning rate: {config.learning_rate}")
+    print(f"KL coefficient: {config.kl_coef}")
+    print(f"KL target value: {config.kl_target}")
+    print(f"Value function coefficient: {config.vf_coef}")
+    print(f"Action space size: {config.action_space}")
+    print(f"Number of samples per epoch: {config.num_syn_samples}")
+    print(f"Run ID: {config.run_id}")
+    print(f"Random seed: {config.seed}")
     print("=" * 60)
     
-    # 开始训练
+    # Start training
     try:
         trainer = CodeTranslationTrainer(config)
         trainer.train()
     except KeyboardInterrupt:
-        print("\n训练被用户中断")
+        print("\nTraining interrupted by user")
     except Exception as e:
-        print(f"训练过程中发生错误: {e}")
+        print(f"Error during training: {e}")
         import traceback
         traceback.print_exc()
         sys.exit(1)
