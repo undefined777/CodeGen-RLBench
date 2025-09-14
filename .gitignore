@@ -1,5 +1,6 @@
 # Byte-compiled / optimized / DLL files
 __pycache__/
+*.pyc
 *.py[cod]
 *$py.class
 
@@ -185,3 +186,13 @@ results/
 outputs/ 
 *.safetensors
 *.0
+
+*.pdf
+*.png
+print*
+DATA_CONVERSION_README.md
+EVALUATION_README.md
+baseline_model/checkpoint-200/latest
+compiler/__pycache__/terminal_compiler.cpython-38.pyc
+compiler/__pycache__/compilers.cpython-38.pyc
+baseline_model/checkpoint-200/zero_to_fp32.py

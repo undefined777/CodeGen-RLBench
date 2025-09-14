@@ -128,7 +128,6 @@ def get_reward(lang, code_ids=None,code_ref_ids=None,gold_ids=None, tokenizer=No
     code_ref_ids = np.array(code_ref_ids.cpu())
     gold_ids = np.array(gold_ids.cpu())
     
-    # 🔧 修复：为每个tensor单独计算eos_positions
     eos_positions = []
     max_len = code_ids.shape[1]
     for id in code_ids:
@@ -137,7 +136,6 @@ def get_reward(lang, code_ids=None,code_ref_ids=None,gold_ids=None, tokenizer=No
         else:
             eos_positions.append(max_len)
     
-    # 🔧 修复：为code_ref_ids单独计算eos_positions
     eos_positions_ref = []
     max_len_ref = code_ref_ids.shape[1]
     for id in code_ref_ids:
@@ -146,7 +144,6 @@ def get_reward(lang, code_ids=None,code_ref_ids=None,gold_ids=None, tokenizer=No
         else:
             eos_positions_ref.append(max_len_ref)
     
-    # 🔧 修复：为gold_ids单独计算eos_positions
     eos_positions_gold = []
     max_len_gold = gold_ids.shape[1]
     for id in gold_ids:
@@ -195,13 +192,12 @@ def get_reward(lang, code_ids=None,code_ref_ids=None,gold_ids=None, tokenizer=No
     dfg_match_batch_ref = 0
     compile_batch_ref = 0
     
-    # 新增：每个样本的详细信息
-    sample_compilation_success = []  # 每个样本的编译成功状态
-    sample_ast_match = []           # 每个样本的AST匹配分数
-    sample_dfg_match = []           # 每个样本的DFG匹配分数
-    sample_compilation_success_ref = []  # 参考样本的编译成功状态
-    sample_ast_match_ref = []           # 参考样本的AST匹配分数
-    sample_dfg_match_ref = []           # 参考样本的DFG匹配分数
+    sample_compilation_success = []  # Each sample's compilation success status
+    sample_ast_match = []           # Each sample's AST matching score
+    sample_dfg_match = []           # Each sample's DFG matching score
+    sample_compilation_success_ref = []  # Reference sample's compilation success status
+    sample_ast_match_ref = []           # Reference sample's AST matching score
+    sample_dfg_match_ref = []           # Reference sample's DFG matching score
     
     for i in range(len(rewards)):
         _, _, did_compile = compilation[i]
@@ -224,7 +220,7 @@ def get_reward(lang, code_ids=None,code_ref_ids=None,gold_ids=None, tokenizer=No
         ast_match_batch += ast_match
         dfg_match_batch += dfg_match
         
-        # 记录每个样本的详细信息
+        # Record each sample's detailed information
         sample_compilation_success.append(did_compile)
         sample_ast_match.append(ast_match)
         sample_dfg_match.append(dfg_match)
@@ -245,7 +241,7 @@ def get_reward(lang, code_ids=None,code_ref_ids=None,gold_ids=None, tokenizer=No
         ast_match_batch_ref += ast_match_ref
         dfg_match_batch_ref += dfg_match_ref
         
-        # 记录参考样本的详细信息
+        # Record reference sample's detailed information
         sample_compilation_success_ref.append(did_compile_ref)
         sample_ast_match_ref.append(ast_match_ref)
         sample_dfg_match_ref.append(dfg_match_ref)
@@ -257,7 +253,7 @@ def get_reward(lang, code_ids=None,code_ref_ids=None,gold_ids=None, tokenizer=No
     mean_ast_match_ref =  ast_match_batch_ref/len(codes_ref) 
     mean_dfg_match_ref =  dfg_match_batch_ref/len(codes_ref)
     
-    # 创建详细的样本信息字典
+    # Create detailed sample information dictionary
     sample_details = {
         'compilation_success': sample_compilation_success,
         'ast_match': sample_ast_match,

@@ -25,7 +25,7 @@ class QwenCoderHeadWithValueModelLocal(nn.Module):
         self.first_dropout = nn.Dropout(0.1)
         self.summary = nn.Linear(self.hidden_size, 1)
         
-        # 🔧 新增：添加config属性以兼容PPO trainer
+        # 🔧 Add config attribute to compatible with PPO trainer
         self.config = self.model.config if self.model else None
 
     def forward(self, input_ids, attention_mask=None, labels=None, decoder_attention_mask=None):
@@ -96,10 +96,10 @@ class QwenCoderHeadWithValueModelLocal(nn.Module):
         with open(info_path, 'w', encoding='utf-8') as f:
             json.dump(model_info, f, indent=2, ensure_ascii=False)
         
-        print(f"✅ 模型保存到: {save_directory}")
-        print(f"   - 基础模型: {save_directory}")
-        print(f"   - 自定义组件: {custom_path}")
-        print(f"   - 模型信息: {info_path}")
+        print(f"✅ Model saved to: {save_directory}")
+        print(f"   - Base model: {save_directory}")
+        print(f"   - Custom components: {custom_path}")
+        print(f"   - Model information: {info_path}")
     
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
@@ -131,24 +131,24 @@ class QwenCoderHeadWithValueModelLocal(nn.Module):
             custom_state_dict = torch.load(custom_path, map_location='cpu')
             model.summary.weight.data = custom_state_dict['summary.weight']
             model.summary.bias.data = custom_state_dict['summary.bias']
-            print(f"✅ 加载自定义组件: {custom_path}")
+            print(f"✅ Load custom components: {custom_path}")
         
         # Initialize the model properly
         model.__init__ = lambda *args, **kwargs: None  # Prevent re-initialization
         return model
 
-def respond_to_batch(model, source_ids, attention_mask, max_target_length=400, top_k=5, top_p=1.0, tokenizer=None):
+def respond_to_batch(model, source_ids, attention_mask, max_target_length=400, top_k=5, top_p=1.0, tokenizer=None,temperature=0.7,repetition_penalty=1.1, do_sample=True):
     """
     Generate responses from batch prompts. Supports wrapper or HF original model.
     """
     #print(f"respond_to_batch input: source_ids={source_ids.shape}, attention_mask={attention_mask.shape}")
     hf_model = model.model
     generation_config = {
-        'do_sample': True,
+        'do_sample': do_sample,
         'top_k': top_k,
         'top_p': top_p,
-        'temperature': 0.7,  # 🔧 新增：添加temperature减少重复
-        'repetition_penalty': 1.1,  # 🔧 新增：添加repetition_penalty减少重复
+        'temperature': temperature,  # 🔧 Add temperature to reduce repetition
+        'repetition_penalty': repetition_penalty,  # 🔧 Add repetition_penalty to reduce repetition
         "max_new_tokens": max_target_length,
         "pad_token_id": tokenizer.pad_token_id,
         "eos_token_id": tokenizer.eos_token_id,

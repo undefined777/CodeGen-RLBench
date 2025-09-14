@@ -127,6 +127,8 @@ def get_tree_sitter_language(lang: str) -> Language:
     :param lang: the language name to get the tree-sitter language for
     :return: the tree-sitter language
     """
+    from tree_sitter import Language
+    
     assert lang in AVAILABLE_LANGS, f"Language {lang} not available. Available languages: {AVAILABLE_LANGS}"
 
     try:
@@ -152,8 +154,7 @@ def get_tree_sitter_language(lang: str) -> Language:
             import tree_sitter_cpp
             return Language(tree_sitter_cpp.language(), "cpp")
         elif lang == "python":
-            import tree_sitter_python
-            return Language(tree_sitter_python.language(), "python")
+            return Language('code_parser/my-languages.so', 'python')
         elif lang == "go":
             import tree_sitter_go
             return Language(tree_sitter_go.language(), "go")

@@ -14,7 +14,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from optimized_rl_trainer import CodeTranslationTrainer, TrainingConfig
+from rl_trainer import CodeTranslationTrainer, TrainingConfig
 
 
 def load_config_from_file(config_path: str) -> TrainingConfig:

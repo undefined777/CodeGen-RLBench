@@ -4,579 +4,365 @@ __all__ = ['AdaptiveKLController', 'FixedKLController', 'PPOCoderTrainer']
 
 # Cell
 import numpy as np
-import torch.nn.functional as F
-from torch.optim import Adam, AdamW
-import torch.optim as optim
 import torch
-import collections
+import torch.optim as optim
 import time
-import random
 import logging
+from torch.optim import AdamW
 from transformers import RobertaTokenizer
-from utils import (logprobs_from_logits,
-                         whiten,
-                         clip_by_value,
-                         entropy_from_logits,
-                         flatten_dict,
-                         average_torch_dicts,
-                         stats_to_np,
-                         stack_dicts,
-                         add_suffix)
-from mem import log_mem, mem_guard
+from utils import logprobs_from_logits
 from dataclasses import dataclass
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional
+
+
+@torch.no_grad()
+def whiten_advantages(
+    advantages: torch.Tensor,   # [B, T]
+    mask: torch.Tensor,         # [B, T] in {0,1} or bool
+    mode: str = "per_sequence", # "per_sequence"(default) or "per_batch"
+    clip_value: float = None,   # optional: clip before whitening, e.g. 10.0
+    eps: float = 1e-8,
+    detach_output: bool = True  # PPO often uses A as weights, default no backprop
+) -> torch.Tensor:
+    """
+    Single-GPU, streamlined and robust advantage normalization:
+    - mask-aware
+    - per-sequence(recommended) or per-batch
+    - statistics in fp32; output preserves original dtype
+    - optional gentle clipping; only one whitening
+    """
+    assert advantages.shape == mask.shape and advantages.dim() == 2
+    A = advantages.clone()
+    M = mask.to(dtype=torch.float32)
+    A = A * (M.sum(dim=1, keepdim=True) > 0).float()  # Zero out samples with no valid tokens, defensive
+
+    if clip_value is not None:
+        A = A.clamp_(-clip_value, clip_value)
+
+    A32 = A.float()
+
+    if mode == "per_sequence":
+        valid = M.sum(dim=1, keepdim=True).clamp_min(1.0)
+        mean  = (A32 * M).sum(dim=1, keepdim=True) / valid
+        var   = ((A32 - mean)**2 * M).sum(dim=1, keepdim=True) / valid
+        std   = (var + eps).sqrt()
+        A32   = (A32 - mean) / std
+    elif mode == "per_batch":
+        valid = M.sum().clamp_min(1.0)
+        mean  = (A32 * M).sum() / valid
+        var   = ((A32 - mean)**2 * M).sum() / valid
+        std   = (var + eps).sqrt()
+        A32   = (A32 - mean) / std
+    else:
+        raise ValueError("mode must be 'per_sequence' or 'per_batch'")
+
+    A32 = A32 * M  # Only keep valid tokens
+    Aout = A32.to(advantages.dtype)
+    return Aout.detach() if detach_output else Aout
 
 
 @dataclass
 class PPOConfig:
     """PPOcoder configuration parameters"""
-    # 基础学习参数
+    # Learning parameters
     lr: float = 1e-5
     adam_eps: float = 1e-8
     
-    # PPO 核心参数
-    gamma: float = 0.99           # Discount factor
-    lam: float = 0.95            # GAE lambda
-    cliprange: float = 0.2       # PPO clip range
-    cliprange_value: float = 0.2  # Value function clip range
-    vf_coef: float = 0.5         # Value function loss coefficient
-    ppo_epochs: int = 4          # PPO optimization epochs
+    # PPO parameters
+    gamma: float = 1
+    lam: float = 0.99
+    cliprange: float = 0.2
+    cliprange_value: float = 0.2
+    vf_coef: float = 0.5
+    ppo_epochs: int = 2
     
-    # 批处理参数
+    # Batch processing parameters
     batch_size: int = 48
-    minibatch_size: int = 12     # PPO minibatch size
+    minibatch_size: int = 12
     forward_batch_size: int = 16
+    gradient_accumulation_steps: int = 1
     
-    # 梯度累积参数
-    gradient_accumulation_steps: int = 1  # 梯度累积步数，增加有效批次大小
+    # KL control parameters
+    init_kl_coef: float = 0.05
+    kl_target: float = 1
+    adaptive_kl: bool = True
+    horizon: int = 10000
     
-    # 🔧 New: 阶段性训练参数
-    critic_warmup_steps: int = 0  # critic预热步数，在此期间只训练critic，0表示不预热
+    # KL penalty distribution strategy
+    kl_penalty_strategy: str = "eos_concentrated"  # "eos_concentrated" or "distributed"
     
-    # KL 控制器参数
-    init_kl_coef: float = 0.05    # Initial KL coefficient
-    kl_target: float = 1       # KL target value
-    adaptive_kl: bool = True     # Whether to use adaptive KL control
-    horizon: int = 10000         # Time window for KL controller adjustment
+    # KL penalty application mode
+    kl_penalty_mode: str = "reward"  # "reward" or "loss"
     
-    # 设备配置
+    # Other configuration
     device: str = "cuda"
-    
-    # Tokenizer
     tokenizer: RobertaTokenizer = None
+    max_grad_norm: float = 1.0  # Gradient clipping threshold
 
 
 class AdaptiveKLController:
-    """Adaptive KL divergence controller, dynamically adjusting KL penalty coefficient"""
-    
+    """Adaptive KL divergence controller"""
     def __init__(self, init_kl_coef: float, target: float, horizon: int = 10000):
-        self.value = init_kl_coef
-        self.target = target
-        self.horizon = horizon
+        self.value, self.target, self.horizon = init_kl_coef, target, horizon
 
     def update(self, current_kl: float, n_steps: int) -> None:
-        """Update coefficient based on current KL divergence"""
         proportional_error = np.clip(current_kl / self.target - 1, -0.2, 0.2)
-        mult = 1 + proportional_error * n_steps / self.horizon
-        self.value *= mult
+        self.value *= 1 + proportional_error * n_steps / self.horizon
 
-        
 class FixedKLController:
     """Fixed KL divergence controller"""
-    
     def __init__(self, kl_coef: float):
         self.value = kl_coef
-
     def update(self, current_kl: float, n_steps: int) -> None:
-        """Fixed coefficient, no update"""
         pass
 
 
 class PPOCoderTrainer:
-    """
-    PPOCoder trainer: Deep reinforcement learning for code generation based on execution feedback
-    
-    Core features:
-    1. Multi-dimensional rewards from compiler feedback, AST matching, and DFG matching
-    2. Adaptive KL divergence control to prevent divergence from reference model
-    3. PPO algorithm specifically optimized for code generation tasks
-    4. Supports Qwen2.5-Coder and other large code models
-    """
+    """PPOCoder trainer for code generation with execution feedback"""
 
     def __init__(self, model, ref_model, config: Optional[PPOConfig] = None, **kwargs):
-        """
-        Initialize PPOCoder trainer
-        
-        Args:
-            model: Training policy model (Actor + Critic)
-            ref_model: Reference model, used to calculate KL divergence
-            config: PPO configuration parameters
-        """
         self.config = config or PPOConfig()
         
-        # Backward compatibility: map old parameter names to new parameter names
-        param_mapping = {
-            'adap_kl_ctrl': 'adaptive_kl',
-            'target': 'kl_target', 
-            'horizon': 'horizon'  # If needed
-        }
-        
-        # Update configuration parameters
+        # Backward compatibility parameter mapping
+        param_mapping = {'adap_kl_ctrl': 'adaptive_kl', 'target': 'kl_target'}
         for key, value in kwargs.items():
-            # Check if the parameter name needs to be mapped
             mapped_key = param_mapping.get(key, key)
             if hasattr(self.config, mapped_key):
                 setattr(self.config, mapped_key, value)
-            elif hasattr(self.config, key):
-                setattr(self.config, key, value)
         
-        self.model = model
-        self.ref_model = ref_model
-        
-        # Optimizer settings
-        self.optimizer = AdamW(
-            model.parameters(), 
-            lr=self.config.lr, 
-            eps=self.config.adam_eps
-        )
-        
-        # Learning rate scheduler
+        self.model, self.ref_model = model, ref_model
+        self.optimizer = AdamW(model.parameters(), lr=self.config.lr, eps=self.config.adam_eps)
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer=self.optimizer, 
-            factor=1.0/np.cbrt(2), 
-            patience=100, 
-            verbose=True
-        )
+            self.optimizer, factor=1.0/np.cbrt(2), patience=100, verbose=True)
         
-        # KL divergence controller
-        if self.config.adaptive_kl:
-            self.kl_controller = AdaptiveKLController(
-                self.config.init_kl_coef,
-                self.config.kl_target,
-                self.config.horizon
-            )
-        else:
-            self.kl_controller = FixedKLController(self.config.init_kl_coef)
+        # KL controller
+        self.kl_controller = (AdaptiveKLController(self.config.init_kl_coef, self.config.kl_target, self.config.horizon) 
+                             if self.config.adaptive_kl else FixedKLController(self.config.init_kl_coef))
         
-        # Training statistics
-        self.training_stats = {}
-        self.step_count = 0
-        
-        # Set logger
+        self.training_stats, self.step_count = {}, 0
         self.logger = logging.getLogger(__name__)
 
-    def compute_gae_advantages(
-        self, 
-        rewards: torch.Tensor, 
-        values: torch.Tensor,
-        masks: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Use Generalized Advantage Estimation (GAE) to compute advantage function
-        
-        Args:
-            rewards: Reward tensor [batch_size, seq_len]
-            values: Value function output [batch_size, seq_len]
-            masks: Valid position mask [batch_size, seq_len]
-            
-        Returns:
-            advantages: Advantage function values
-            returns: Return values
-        """
+    def compute_gae_advantages(self, rewards: torch.Tensor, values: torch.Tensor, masks: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute advantage function using GAE"""
+        calc_dtype = rewards.dtype
+        values, masks = values.to(calc_dtype), masks.to(calc_dtype)
         batch_size, seq_len = rewards.shape
-        advantages = torch.zeros_like(rewards)
-        last_gae_lam = torch.zeros(batch_size, device=rewards.device)
+        advantages = torch.zeros_like(rewards, dtype=calc_dtype)
+        last_gae_lam = torch.zeros(batch_size, device=rewards.device, dtype=calc_dtype)
         
-        for t in reversed(range(seq_len)):
-            if t == seq_len - 1:
-                next_non_terminal = torch.zeros(batch_size, device=rewards.device)
-                next_values = torch.zeros(batch_size, device=rewards.device)
-            else:
-                next_non_terminal = masks[:, t + 1]
-                next_values = values[:, t + 1]
-            mask_t = masks[:, t]
-            delta = (rewards[:, t] + 
-                    self.config.gamma * next_values * next_non_terminal - 
-                    values[:, t]) * mask_t
-            
-            advantages[:, t] = last_gae_lam = (
-                delta + 
-                self.config.gamma * self.config.lam * next_non_terminal * last_gae_lam
-            ) * mask_t
+        # 🔧 Important: use detached values to compute advantages, prevent gradient propagation
+        with torch.no_grad():
+            values_detached = values.detach()
+            for t in reversed(range(seq_len)):
+                next_non_terminal = masks[:, t + 1] if t < seq_len - 1 else torch.zeros(batch_size, device=rewards.device)
+                next_values = values_detached[:, t + 1] if t < seq_len - 1 else torch.zeros(batch_size, device=rewards.device)
+                mask_t = masks[:, t]
+                delta = (rewards[:, t] + self.config.gamma * next_values * next_non_terminal - values_detached[:, t]) * mask_t
+                advantages[:, t] = last_gae_lam = (delta + self.config.gamma * self.config.lam * next_non_terminal * last_gae_lam) * mask_t
         
-        returns = advantages + values
-        return advantages, returns
+        # returns still need original values to compute value loss
+        returns = advantages.detach() + values
+        return advantages.detach(), returns
 
-    def compute_policy_loss(
-        self, 
-        log_probs: torch.Tensor,
-        old_log_probs: torch.Tensor,
-        advantages: torch.Tensor,
-        masks: torch.Tensor
-    ) -> Tuple[torch.Tensor, Dict]:
-        """
-        Compute PPO policy loss
-        
-        Args:
-            log_probs: New policy log probabilities
-            old_log_probs: Old policy log probabilities  
-            advantages: Advantage function values
-            masks: Valid position mask
-            
-        Returns:
-            loss: Policy loss
-            stats: Training statistics
-        """
-        # Calculate importance sampling ratio
+    def compute_policy_loss(self, log_probs: torch.Tensor, old_log_probs: torch.Tensor, advantages: torch.Tensor, masks: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
+        """Compute PPO policy loss - fix length bias"""
         ratio = torch.exp(log_probs - old_log_probs)
-        
-        # PPO clipped objective function
         surr1 = ratio * advantages
-        surr2 = torch.clamp(
-            ratio, 
-            1.0 - self.config.cliprange, 
-            1.0 + self.config.cliprange
-        ) * advantages
+        surr2 = torch.clamp(ratio, 1.0 - self.config.cliprange, 1.0 + self.config.cliprange) * advantages
         
-        # Only calculate loss at valid positions
-        policy_loss = -torch.where(
-            advantages >= 0,
-            torch.min(surr1, surr2),
-            torch.max(surr1, surr2)
-        )
+        policy_loss = -torch.where(advantages >= 0, torch.min(surr1, surr2), torch.max(surr1, surr2))
         
-        # Apply mask and calculate average loss
-        weighted_policy_loss = (policy_loss * masks).sum(1) / masks.sum(1).clamp(min=1)
-        policy_loss = weighted_policy_loss.mean()
+        # 🔧 Fix length bias: divide by valid token count per sample first, then batch mean
+        per_sample_loss = (policy_loss * masks).sum(dim=1) / masks.sum(dim=1).clamp(min=1)
+        policy_loss = per_sample_loss.mean()
         
-        # Calculate clipping ratio
-        clip_fraction = ((ratio > 1 + self.config.cliprange) | 
-                        (ratio < 1 - self.config.cliprange)).float()
+        clip_fraction = ((ratio > 1 + self.config.cliprange) | (ratio < 1 - self.config.cliprange)).float()
         clip_fraction = (clip_fraction * masks).sum() / masks.sum()
         
-        stats = {
+        return policy_loss, {
             'policy_loss': policy_loss.detach(),
             'clip_fraction': clip_fraction.detach(),
             'approx_kl': ((0.5 * (log_probs - old_log_probs).pow(2) * masks).sum() / masks.sum()).detach(),
             'ratio_mean': ((ratio * masks).sum() / masks.sum()).detach()
         }
-        
-        return policy_loss, stats
 
-    def compute_value_loss(
-        self, 
-        values: torch.Tensor,
-        old_values: torch.Tensor,
-        returns: torch.Tensor,
-        masks: torch.Tensor
-    ) -> Tuple[torch.Tensor, Dict]:
-        """
-        Compute value function loss
-        
-        Args:
-            values: New value function output
-            old_values: Old value function output
-            returns: Target return values
-            masks: Valid position mask
-            
-        Returns:
-            loss: Value function loss
-            stats: Training statistics
-        """
-        # Value function clipping
-        values_clipped = torch.clamp(
-            values,
-            old_values - self.config.cliprange_value,
-            old_values + self.config.cliprange_value
-        )
-        
-        # Calculate two losses
-        vf_loss1 = (values - returns).pow(2)
-        vf_loss2 = (values_clipped - returns).pow(2)
-        vf_loss_tok = 0.5 * torch.max(vf_loss1, vf_loss2)   # 按token
-
-        # 只在有效位置计算loss（mask为1的位置）
-        vf_loss_tok = vf_loss_tok * masks
-
-        # 归一化：每个样本的有效token数
-        vf_loss = vf_loss_tok.sum(1) / masks.sum(1).clamp(min=1)
-        
-        # Apply mask and calculate average loss
+    def compute_value_loss(self, values: torch.Tensor, old_values: torch.Tensor, returns: torch.Tensor, masks: torch.Tensor) -> Tuple[torch.Tensor, Dict]:
+        """Compute value function loss"""
+        values_clipped = torch.clamp(values, old_values - self.config.cliprange_value, old_values + self.config.cliprange_value)
+        vf_loss1, vf_loss2 = (values - returns).pow(2), (values_clipped - returns).pow(2)
+        vf_loss = (0.5 * torch.max(vf_loss1, vf_loss2) * masks).sum(1) / masks.sum(1).clamp(min=1)
         vf_loss = vf_loss.mean()
         
-        # Calculate clipping ratio
-        vf_clip_fraction = (values != values_clipped).float()
-        vf_clip_fraction = (vf_clip_fraction * masks).sum() / masks.sum()
+        vf_clip_fraction = ((values != values_clipped).float() * masks).sum() / masks.sum()
         
-        stats = {
+        return vf_loss, {
             'value_loss': vf_loss.detach(),
             'value_clip_fraction': vf_clip_fraction.detach(),
             'values_mean': ((values * masks).sum() / masks.sum()).detach(),
             'returns_mean': ((returns * masks).sum() / masks.sum()).detach(),
             'returns_var': torch.var(returns[masks.bool()]).detach()
         }
-        
-        return vf_loss, stats
 
-    def forward_pass(
-        self, 
-        input_ids: torch.Tensor, 
-        attention_mask: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Model forward pass
-        
-        Args:
-            input_ids: Input token sequence
-            attention_mask: Attention mask
-            
-        Returns:
-            logits: Output logits
-            log_probs: Log probabilities
-            values: Value function output
-        """
+    def forward_pass(self, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Model forward pass"""
         with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-            outputs = self.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=None
-            )
-            
-        logits, _, values = outputs
-        
-        # 计算对数概率 (对于生成的token)
+            logits, _, values = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=None)
         log_probs = logprobs_from_logits(logits[:, :-1], input_ids[:, 1:])
-        
         return logits, log_probs, values[:, :-1]
 
-    def compute_rewards_with_kl_penalty(
-        self, 
-        log_probs: torch.Tensor,
-        ref_log_probs: torch.Tensor,
-        reward_scores: torch.Tensor,
-        mask: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, float]:
-        """
-        计算带KL惩罚的最终奖励（标准token级别KL惩罚，不做序列平均）
-
-        Args:
-            log_probs: 当前策略的对数概率
-            ref_log_probs: 参考策略的对数概率
-            reward_scores: 外部奖励（如编译+AST+DFG）
-            mask: 响应序列的mask（1为有效，0为padding）
-        Returns:
-            final_rewards: 最终奖励
-            kl_penalties: KL惩罚
-            kl_coef: 当前KL系数
-        """
-        # 逐token计算KL散度
-        kl_divergence = log_probs - ref_log_probs  # [batch, seq_len]
-        kl_penalties = -self.kl_controller.value * kl_divergence  # [batch, seq_len]
-        kl_penalties = kl_penalties * mask  # 只对有效token生效
-
-        # 最终奖励 = 外部奖励 + KL惩罚（逐token相加）
-        final_rewards = reward_scores + kl_penalties
-
+    def compute_rewards_with_kl_penalty(self, log_probs: torch.Tensor, ref_log_probs: torch.Tensor, reward_scores: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, float]:
+        """Compute final reward with KL penalty - supports two strategies"""
+        if self.config.kl_penalty_strategy == "eos_concentrated":
+            # Strategy 1: KL penalty concentrated at EOS position, considering sequence length normalization
+            batch_size, seq_len = log_probs.shape
+            
+            # Calculate average KL divergence per sequence (normalized per token)
+            kl_per_sequence = torch.zeros(batch_size, device=log_probs.device)
+            for i in range(batch_size):
+                # Find valid length of this sequence
+                valid_length = mask[i].sum().item()
+                if valid_length > 0:
+                    # Calculate KL divergence for this sequence and normalize
+                    valid_length_int = int(valid_length)  # Ensure integer
+                    seq_kl_sum = (log_probs[i, :valid_length_int] - ref_log_probs[i, :valid_length_int]).sum()
+                    # 🔧 Use average KL divergence to avoid sequence length bias
+                    kl_per_sequence[i] = seq_kl_sum / valid_length
+            
+            # Create KL penalty tensor, only place normalized KL penalty at EOS position
+            kl_penalties = torch.zeros_like(reward_scores)
+            
+            # Find EOS position for each sequence
+            for i in range(batch_size):
+                # Find EOS position (last valid token)
+                valid_positions = (mask[i] > 0.5).nonzero(as_tuple=True)[0]
+                if len(valid_positions) > 0:
+                    eos_pos = valid_positions[-1].item()
+                    # Place normalized KL penalty at EOS position
+                    kl_penalties[i, eos_pos] = -self.kl_controller.value * kl_per_sequence[i]
+        
+        elif self.config.kl_penalty_strategy == "distributed":
+            # Strategy 2: Original PPO approach - KL penalty distributed across all token positions
+            kl_penalties = -self.kl_controller.value * (log_probs.detach() - ref_log_probs.detach()) * mask
+        
+        else:
+            raise ValueError(f"Unsupported KL penalty strategy: {self.config.kl_penalty_strategy}")
+        
+        # Decide whether to apply KL penalty to reward based on mode
+        if self.config.kl_penalty_mode == "reward":
+            # Mode 1: KL penalty applied to reward (original PPO approach)
+            final_rewards = reward_scores + kl_penalties
+        elif self.config.kl_penalty_mode == "loss":
+            # Mode 2: KL penalty not applied to reward, will be added during loss calculation
+            final_rewards = reward_scores
+        else:
+            raise ValueError(f"Unsupported KL penalty mode: {self.config.kl_penalty_mode}")
+        
         return final_rewards, kl_penalties, self.kl_controller.value
 
-    def train_step(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        rewards: torch.Tensor,
-        old_log_probs: torch.Tensor,
-        old_values: torch.Tensor,
-        response_mask: torch.Tensor
-    ) -> Dict:
-        """
-        Execute one PPO training step
-        
-        Args:
-            input_ids: Input sequence
-            attention_mask: Attention mask
-            rewards: Reward signal
-            old_log_probs: Old policy log probabilities
-            old_values: Old value function output
-            response_mask: Mask for response sequences (1 for valid, 0 for padding)
-            
-        Returns:
-            Training statistics dictionary
-        """
-        batch_size = input_ids.size(0)
-        all_stats = []
-        
-        # Calculate GAE advantage
-        # Note: rewards, old_log_probs, old_values now only contain response part
+    def train_step(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, rewards: torch.Tensor, 
+                   old_log_probs: torch.Tensor, old_values: torch.Tensor, response_mask: torch.Tensor) -> Dict:
+        """Execute one PPO training step"""
+        batch_size, all_stats = input_ids.size(0), []
         advantages, returns = self.compute_gae_advantages(rewards, old_values, response_mask)
         
-        # Standardize advantage
-        normalized_advantages_stats = {}  # 存储标准化后的统计信息
-        if response_mask.sum() > 1:
-            # Standardize advantage at valid positions
-            valid_advantages = advantages[response_mask.bool()]
-            if len(valid_advantages) > 1:
-                whitened_valid = whiten(valid_advantages)
-                advantages = advantages.clone()
-                advantages[response_mask.bool()] = whitened_valid
-                
-                # 🔧 计算标准化后advantages的统计信息
-                valid_normalized_advantages = advantages[response_mask.bool()]
-                normalized_advantages_stats = {
-                    'normalized_advantages_mean': (advantages * response_mask).sum() / response_mask.sum(),
-                    'normalized_advantages_std': valid_normalized_advantages.std().item() if len(valid_normalized_advantages) > 1 else 0.0,
-                    'normalized_advantages_max': valid_normalized_advantages.max().item() if len(valid_normalized_advantages) > 0 else 0.0,
-                    'normalized_advantages_min': valid_normalized_advantages.min().item() if len(valid_normalized_advantages) > 0 else 0.0,
-                }
-            else:
-                # 没有足够的数据进行标准化，使用原始数据
-                normalized_advantages_stats = {
-                    'normalized_advantages_mean': (advantages * response_mask).sum() / response_mask.sum(),
-                    'normalized_advantages_std': 0.0,
-                    'normalized_advantages_max': advantages.max().item() if response_mask.sum() > 0 else 0.0,
-                    'normalized_advantages_min': advantages.min().item() if response_mask.sum() > 0 else 0.0,
-                }
-        else:
-            # 没有有效数据
-            normalized_advantages_stats = {
-                'normalized_advantages_mean': 0.0,
-                'normalized_advantages_std': 0.0,
-                'normalized_advantages_max': 0.0,
-                'normalized_advantages_min': 0.0,
-            }
+        # EOS advantage statistics
+        mask_counts = response_mask.sum(dim=1, dtype=torch.long)
+        eos_indices = (mask_counts - 1).clamp(min=0)
+        batch_indices = torch.arange(batch_size, device=advantages.device)
+        adv_at_eos_before = advantages[batch_indices, eos_indices].mean().item()
+
+        # Use whiten_advantages for normalization
+        advantages = whiten_advantages(
+            advantages=advantages,
+            mask=response_mask,
+            mode="per_sequence",  # Per-sequence normalization
+            clip_value=10.0,      # Gentle clipping
+            eps=1e-8,
+            detach_output=True
+        )
         
-        # PPO multiple optimization epochs
+        # Statistics
+        valid_mask = response_mask.bool()
+        has_valid_data = valid_mask.any()
+        
+        if has_valid_data:
+            valid_normalized_advantages = advantages[valid_mask]
+            adv_at_eos_after = advantages[batch_indices, eos_indices].mean().item()
+            compression_ratio = adv_at_eos_after / adv_at_eos_before if adv_at_eos_before != 0 else 0.0
+            normalized_advantages_stats = {
+                'normalized_advantages_mean': valid_normalized_advantages.mean().item(),
+                'normalized_advantages_std': valid_normalized_advantages.std().item(),
+                'debug/advantage_at_eos_before_whiten': adv_at_eos_before,
+                'debug/advantage_at_eos_after_whiten': adv_at_eos_after,
+                'debug/advantage_at_eos_compression_ratio': compression_ratio
+            }
+        else:
+            normalized_advantages_stats = {
+                'normalized_advantages_mean': 0.0, 'normalized_advantages_std': 0.0,
+                'debug/advantage_at_eos_before_whiten': adv_at_eos_before,
+                'debug/advantage_at_eos_after_whiten': adv_at_eos_before,
+                'debug/advantage_at_eos_compression_ratio': 1.0 if adv_at_eos_before != 0 else 0.0
+            }
+
+        
+        # PPO training loop
         for epoch in range(self.config.ppo_epochs):
-            # Randomly shuffle data
             perm = torch.randperm(batch_size, device=input_ids.device)
-            
-            # Mini-batch training with gradient accumulation
-            accumulation_step = 0
-            self.optimizer.zero_grad()  # 在每个epoch开始时清零梯度
-            
-            # 🔧 Fix: 每个PPO epoch重新初始化统计列表，避免累积
-            epoch_stats = []
+            accumulation_step, epoch_stats = 0, []
+            self.optimizer.zero_grad()
             
             for start in range(0, batch_size, self.config.minibatch_size):
-                end = min(start + self.config.minibatch_size, batch_size)
-                idx = perm[start:end]
-                
+                idx = perm[start:min(start + self.config.minibatch_size, batch_size)]
                 # Get mini-batch data
-                mb_input_ids = input_ids[idx]
-                mb_attention_mask = attention_mask[idx]
-                mb_rewards = rewards[idx]
-                mb_old_log_probs = old_log_probs[idx]
-                mb_old_values = old_values[idx]
-                mb_advantages = advantages[idx]
-                mb_returns = returns[idx]
-                mb_response_mask = response_mask[idx]
+                mb_data = [t[idx] for t in [input_ids, attention_mask, rewards, old_log_probs, old_values, advantages, returns, response_mask]]
+                mb_input_ids, mb_attention_mask, mb_rewards, mb_old_log_probs, mb_old_values, mb_advantages, mb_returns, mb_response_mask = mb_data
                 
-                # 🔧 New: 根据训练阶段决定是否需要计算policy（节省显存）
-                if self.step_count < self.config.critic_warmup_steps:
-                    # Critic预热阶段：只需要计算value，跳过policy计算以节省显存
-                    # 只进行value相关的前向传播
-                    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                        outputs = self.model(
-                            input_ids=mb_input_ids,
-                            attention_mask=mb_attention_mask,
-                            labels=None
-                        )
-                    
-                    _, _, full_values = outputs  # 只需要values
-                    # 🔧 Fix: 保持与forward_pass一致，去掉最后一位
-                    full_values = full_values[:, :-1]  # 与forward_pass保持一致
-                    source_len = mb_input_ids.size(1) - mb_rewards.size(1)
-                    response_values = full_values[:, source_len-1:]
-                    
-                    # 只计算value loss
-                    value_loss, value_stats = self.compute_value_loss(
-                        response_values, mb_old_values, mb_returns, mb_response_mask
-                    )
-                    
-                    # 创建空的policy_stats以保持统计信息一致性
-                    policy_stats = {
-                        'policy_loss': torch.tensor(0.0),
-                        'entropy': torch.tensor(0.0),
-                        'approx_kl': torch.tensor(0.0),
-                        'clipfrac': torch.tensor(0.0),
-                        'ratio_mean': torch.tensor(1.0)
-                    }
-                    
-                    total_loss = self.config.vf_coef * value_loss
-                    
-                    # 记录当前处于预热阶段
-                    if accumulation_step == 1:  # 只在每个mini-batch的第一步记录一次
-                        self.logger.debug(f"Critic warmup phase: step {self.step_count}/{self.config.critic_warmup_steps}")
-                        
-                else:
-                    # 正常训练阶段：需要完整的前向传播
-                    _, full_log_probs, full_values = self.forward_pass(mb_input_ids, mb_attention_mask)
-                    
-                    # Extract response part for loss calculation
-                    # Need to calculate source length to determine response start position
-                    source_len = mb_input_ids.size(1) - mb_rewards.size(1)
-                    response_log_probs = full_log_probs[:, source_len-1:]
-                    response_values = full_values[:, source_len-1:]
-                    
-                    # Calculate loss (only for response part)
-                    policy_loss, policy_stats = self.compute_policy_loss(
-                        response_log_probs, mb_old_log_probs, mb_advantages, mb_response_mask
-                    )
-                    
-                    value_loss, value_stats = self.compute_value_loss(
-                        response_values, mb_old_values, mb_returns, mb_response_mask
-                    )
-                    
-                    # 正常训练阶段：同时训练actor和critic
-                    total_loss = policy_loss + self.config.vf_coef * value_loss
+                # Forward pass and loss calculation
+                _, full_log_probs, full_values = self.forward_pass(mb_input_ids, mb_attention_mask)
+                source_len = mb_input_ids.size(1) - mb_rewards.size(1)
+                response_log_probs, response_values = full_log_probs[:, source_len-1:], full_values[:, source_len-1:]
+
+                policy_loss, policy_stats = self.compute_policy_loss(response_log_probs, mb_old_log_probs, mb_advantages, mb_response_mask)
+                value_loss, value_stats = self.compute_value_loss(response_values, mb_old_values, mb_returns, mb_response_mask)
                 
-                # 梯度累积：将loss除以累积步数
+                # Add KL penalty in loss mode
+                kl_loss = 0.0
+                if self.config.kl_penalty_mode == "loss":
+                    # Calculate KL divergence loss
+                    kl_diff = (response_log_probs - mb_old_log_probs) * mb_response_mask
+                    kl_loss = self.kl_controller.value * kl_diff.sum(dim=1).mean()
+                
+                total_loss = policy_loss + self.config.vf_coef * value_loss + kl_loss
+                
+                # 🔧 Fix gradient accumulation: scale loss to avoid effective learning rate amplification
                 scaled_loss = total_loss / self.config.gradient_accumulation_steps
-                
-                # Backward propagation
                 scaled_loss.backward()
-                
-                # 累积计数器
                 accumulation_step += 1
                 
-                # 当累积步数达到设定值时，进行参数更新
                 if accumulation_step % self.config.gradient_accumulation_steps == 0:
-                    # Gradient clipping
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                    
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                     self.optimizer.step()
                     self.optimizer.zero_grad()
                 
-                # Record statistics (使用原始的total_loss而不是scaled_loss)
-                # 🔧 Fix: 转换为标量以避免显存累积
-                stats = {
-                    'total_loss': total_loss.detach().cpu().item(),  # 转为CPU标量
-                    **{k: v.detach().cpu().item() if torch.is_tensor(v) else v for k, v in policy_stats.items()},
-                    **{k: v.detach().cpu().item() if torch.is_tensor(v) else v for k, v in value_stats.items()}
-                }
+                # Record statistics (use original loss, not scaled_loss)
+                stats = {'total_loss': total_loss.detach().cpu().item()}
+                if self.config.kl_penalty_mode == "loss":
+                    stats['kl_loss'] = kl_loss.detach().cpu().item()
+                stats.update({k: v.detach().cpu().item() if torch.is_tensor(v) else v for k, v in {**policy_stats, **value_stats}.items()})
                 epoch_stats.append(stats)
             
-            # 处理最后可能剩余的梯度（如果batch不能被gradient_accumulation_steps整除）
+            # Handle remaining gradients
             if accumulation_step % self.config.gradient_accumulation_steps != 0:
-                # Gradient clipping
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.max_grad_norm)
                 self.optimizer.step()
                 self.optimizer.zero_grad()
-            
-            # 🔧 Fix: 将当前epoch的统计信息添加到总列表
             all_stats.extend(epoch_stats)
         
         # Aggregate statistics
-        # 🔧 Fix: 处理标量统计信息
-        final_stats = {}
-        for key in all_stats[0].keys():
-            # 计算所有mini-batch的平均值
-            values = [s[key] for s in all_stats]
-            final_stats[key] = torch.tensor(sum(values) / len(values))
-        
-        # 🔧 添加标准化后advantages的统计信息
+        all_keys = set().union(*[s.keys() for s in all_stats])
+        final_stats = {key: torch.tensor(sum(float(s[key]) for s in all_stats if key in s) / sum(1 for s in all_stats if key in s)) 
+                      for key in all_keys if any(key in s for s in all_stats)}
         final_stats.update(normalized_advantages_stats)
-        
         return final_stats
 
     def step(
@@ -585,7 +371,7 @@ class PPOCoderTrainer:
         source_mask: torch.Tensor, 
         response_ids: torch.Tensor,
         response_ids_ref: torch.Tensor,
-        reward_scores: torch.Tensor,
+        rewards: torch.Tensor,
         response_mask: torch.Tensor
     ) -> Dict:
         """
@@ -596,7 +382,7 @@ class PPOCoderTrainer:
             source_mask: Source code mask
             response_ids: Generated response sequence
             response_ids_ref: Reference response sequence
-            reward_scores: External reward scores (compiler + AST + DFG)
+            rewards: Reward tensor with shape (batch_size, seq_len), rewards placed at EOS positions
             response_mask: Mask for response sequences (1 for valid, 0 for padding)
             
         Returns:
@@ -610,266 +396,123 @@ class PPOCoderTrainer:
         # Use the provided response_mask instead of creating all-ones mask
         full_attention_mask = torch.cat([source_mask, response_mask], dim=1)
         
-        # 2. Get current policy output (条件性计算，在Critic预热阶段跳过)
+        # 2. Get current policy output
         timing['forward_start'] = time.time()
         
-        if self.step_count < self.config.critic_warmup_steps:
-            # 🔧 Critic预热阶段：跳过昂贵的log_probs计算，只计算values
-            with torch.no_grad():
-                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                    outputs = self.model(
-                        input_ids=full_input_ids,
-                        attention_mask=full_attention_mask,
-                        labels=None
-                    )
-                _, _, old_values = outputs
-                old_values = old_values[:, :-1]  # 与forward_pass保持一致
-                
-                # 创建空的log_probs以保持接口一致
-                old_log_probs = torch.zeros(
-                    old_values.shape, device=old_values.device, dtype=old_values.dtype
+        with torch.no_grad():
+            _, old_log_probs, old_values = self.forward_pass(
+                full_input_ids, full_attention_mask
+            )
+            
+            # Get reference model output
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                ref_outputs = self.ref_model(
+                    input_ids=full_input_ids,
+                    attention_mask=full_attention_mask,
+                    labels=None
                 )
-                ref_log_probs = torch.zeros_like(old_log_probs)
-        else:
-            # 正常训练阶段：完整计算
-            with torch.no_grad():
-                _, old_log_probs, old_values = self.forward_pass(
-                    full_input_ids, full_attention_mask
-                )
-                
-                # Get reference model output
-                with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                    ref_outputs = self.ref_model(
-                        input_ids=full_input_ids,
-                        attention_mask=full_attention_mask,
-                        labels=None
-                    )
-                ref_logits = ref_outputs[0]
-                ref_log_probs = logprobs_from_logits(
-                    ref_logits[:, :-1], full_input_ids[:, 1:]
-                )
+            ref_logits = ref_outputs[0]
+            ref_log_probs = logprobs_from_logits(
+                ref_logits[:, :-1], full_input_ids[:, 1:]
+            )
         
         timing['forward_end'] = time.time()
         
-        # 3. Calculate reward (including KL penalty)
+        # 3. Calculate KL penalty and final rewards
         timing['reward_start'] = time.time()
         
-        # Only calculate reward for response part
+        # Only calculate for response part
         source_len = source_ids.size(1)
         response_log_probs = old_log_probs[:, source_len-1:]
         response_ref_log_probs = ref_log_probs[:, source_len-1:]
         response_values = old_values[:, source_len-1:]
 
-        # 创建和response_log_probs相同大小的全0奖励数组
-        rewards = torch.zeros_like(response_log_probs)
-        
-        # 获取batch中每个序列的EOS位置
-        eos_positions = []
-        for seq in response_ids:
-            # 找到EOS token的位置
-            eos_pos = (seq == self.config.tokenizer.eos_token_id).nonzero()
-            if len(eos_pos) > 0:
-                eos_positions.append(eos_pos[0].item())
-            else:
-                eos_positions.append(len(seq) - 1)
-                
-        # 将奖励值放到对应的EOS位置
-        for i, (eos_pos, reward) in enumerate(zip(eos_positions, reward_scores)):
-            # reward_scores是一个包含每个序列总奖励值的列表，每个序列只有一个非0值
-            # 提取reward张量中的实际奖励值
-            if isinstance(reward, torch.Tensor):
-                # 如果是张量，找到非零元素
-                non_zero_indices = (reward != 0).nonzero(as_tuple=True)[0]
-                if len(non_zero_indices) > 0:
-                    reward_value = reward[non_zero_indices[0]].item()
-                else:
-                    reward_value = reward.sum().item()
-            else:
-                reward_value = float(reward)
-            
-            # 将该值放到对应序列的EOS位置
-            rewards[i, eos_pos] = reward_value
-
-        # 🔧 Critic预热阶段跳过KL penalty计算
-        if self.step_count < self.config.critic_warmup_steps:
-            # Critic预热阶段：不计算KL penalty，直接使用原始rewards
-            final_rewards = rewards
-            kl_penalties = torch.zeros_like(rewards)
-            kl_coef = self.config.init_kl_coef
-        else:
-            # 正常训练阶段：计算KL penalty
-            final_rewards, kl_penalties, kl_coef = self.compute_rewards_with_kl_penalty(
-                response_log_probs, response_ref_log_probs, rewards, response_mask
-            )
+        # Directly use passed rewards (already correctly placed at EOS position)
+        # Calculate KL penalty
+        final_rewards, kl_penalties, kl_coef = self.compute_rewards_with_kl_penalty(
+            response_log_probs, response_ref_log_probs, rewards, response_mask
+        )
         
         timing['reward_end'] = time.time()
         
         # 4. PPO training step
         timing['train_start'] = time.time()
         
-        # Calculate GAE advantages for statistics (before training)
-        advantages, returns = self.compute_gae_advantages(final_rewards, response_values, response_mask)
+        # Reward mask check
+        nonzero_reward_mask = final_rewards != 0
+        total_nonzero_rewards = nonzero_reward_mask.sum().item()
+        reward_mask_coverage = ((nonzero_reward_mask & (response_mask > 0.5)).sum().item() / total_nonzero_rewards 
+                               if total_nonzero_rewards > 0 else 1.0)
         
-        # Ensure tensors passed to train_step only contain response part, same shape
-        train_stats = self.train_step(
-            full_input_ids,
-            full_attention_mask, 
-            final_rewards,           # [batch_size, response_len]
-            response_log_probs,      # [batch_size, response_len] 
-            response_values,         # [batch_size, response_len]
-            response_mask            # [batch_size, response_len]
-        )
+        # GAE calculation and training
+        advantages, returns = self.compute_gae_advantages(final_rewards, response_values, response_mask)
+        train_stats = self.train_step(full_input_ids, full_attention_mask, final_rewards, 
+                                     response_log_probs, response_values, response_mask)
         
         timing['train_end'] = time.time()
         
-        # 5. Update KL controller
-        mean_kl = ((response_log_probs - response_ref_log_probs) * response_mask).sum() / response_mask.sum()
-        self.kl_controller.update(mean_kl.item(), self.config.batch_size)
+        # KL statistics and learning rate update
+        per_seq_valid = response_mask.sum(dim=1).clamp(min=1)
+        mean_kl = (((response_log_probs - response_ref_log_probs) * response_mask).sum(dim=1) / per_seq_valid).mean()
         
-        # 6. Update learning rate scheduler
-        self.scheduler.step(train_stats['total_loss'])
+        # 🔧 Fix KL controller update - dynamically adjust KL coefficient
+        self.kl_controller.update(mean_kl.item(), self.step_count)
         
-        # 7. Integrate statistics
-        # Calculate advantages statistics for monitoring
-        valid_advantages = advantages[response_mask.bool()]  # 原始advantages (标准化前)
+        # Statistics aggregation
+        valid_advantages = advantages[response_mask.bool()]
+        mask_sum = response_mask.sum()
         
         stats = {
-            'ppo/mean_kl': mean_kl.item(),
-            'ppo/kl_coef': kl_coef,
-            'ppo/mean_reward': (rewards * response_mask).sum() / response_mask.sum(),
-            'ppo/mean_kl_penalty': (kl_penalties * response_mask).sum() / response_mask.sum(),
-            'ppo/mean_final_reward': (final_rewards * response_mask).sum() / response_mask.sum(),
-            
-            # 原始advantages统计 (标准化前)
-            'ppo/advantages_raw_mean': (advantages * response_mask).sum() / response_mask.sum(),
+            'ppo/mean_kl': mean_kl.item(), 'ppo/kl_coef': kl_coef,
+            'ppo/kl_strategy': self.config.kl_penalty_strategy,  # Dynamic strategy identifier
+            'ppo/kl_mode': self.config.kl_penalty_mode,  # KL penalty application mode
+            'ppo/mean_reward': (rewards * response_mask).sum() / mask_sum,
+            'ppo/mean_kl_penalty': (kl_penalties * response_mask).sum() / mask_sum,
+            'ppo/mean_final_reward': (final_rewards * response_mask).sum() / mask_sum,
+            'ppo/reward_mask_coverage': reward_mask_coverage,
+            'ppo/advantages_raw_mean': (advantages * response_mask).sum() / mask_sum,
             'ppo/advantages_raw_std': valid_advantages.std().item() if len(valid_advantages) > 1 else 0.0,
-            'ppo/advantages_raw_max': valid_advantages.max().item() if len(valid_advantages) > 0 else 0.0,
-            'ppo/advantages_raw_min': valid_advantages.min().item() if len(valid_advantages) > 0 else 0.0,
-            
-            # 标准化后advantages统计 (从train_step返回)
             'ppo/advantages_normalized_mean': train_stats.get('normalized_advantages_mean', 0.0),
             'ppo/advantages_normalized_std': train_stats.get('normalized_advantages_std', 0.0),
-            'ppo/advantages_normalized_max': train_stats.get('normalized_advantages_max', 0.0),
-            'ppo/advantages_normalized_min': train_stats.get('normalized_advantages_min', 0.0),
-            
-            # 向后兼容：保持原有的advantages_mean键
-            'ppo/advantages_mean': (advantages * response_mask).sum() / response_mask.sum(),
-            
-            'ppo/returns_mean': (returns * response_mask).sum() / response_mask.sum(),
-            **{f'ppo/{k}': v.item() if hasattr(v, 'item') else v 
-               for k, v in train_stats.items()},
+            'ppo/advantages_mean': (advantages * response_mask).sum() / mask_sum,
+            'ppo/returns_mean': (returns * response_mask).sum() / mask_sum,
+            **{f'ppo/{k}': v.item() if hasattr(v, 'item') else v for k, v in train_stats.items()},
             **{f'time/ppo/{k}': v for k, v in timing.items()}
         }
+
+        # Supplement loss keys and explained variance
+        stats.update({
+            'ppo/loss/total': torch.tensor(float(stats.get('ppo/total_loss', 0.0))),
+            'ppo/loss/policy': torch.tensor(float(stats.get('ppo/policy_loss', 0.0))),
+            'ppo/loss/value': torch.tensor(float(stats.get('ppo/value_loss', 0.0)))
+        })
         
-        # Backward compatibility: add old key name mapping (convert to tensor to support .item() call)
-        def to_tensor_compat(value):
-            """Convert value to compatible tensor, support .item() method call"""
-            if isinstance(value, (int, float)):
-                return torch.tensor(float(value))
-            return value
-        
-        backward_compat_stats = {
-            # Old objective/ key names
-            'objective/kl': to_tensor_compat(stats['ppo/mean_kl']),
-            'objective/kl_coef': to_tensor_compat(stats['ppo/kl_coef']),
-            'objective/entropy': to_tensor_compat(stats.get('ppo/policy_loss', 0.0)),
-            
-            # Old reward key names
-            'ppo/mean_non_score_reward': to_tensor_compat(stats['ppo/mean_kl_penalty']),
-            'ppo/mean_score_reward': to_tensor_compat(stats['ppo/mean_reward']),
-            
-            # Old loss key name format (critical fix: these need to support .item() call)
-            'ppo/loss/total': to_tensor_compat(stats.get('ppo/total_loss', 0.0)),
-            'ppo/loss/policy': to_tensor_compat(stats.get('ppo/policy_loss', 0.0)),
-            'ppo/loss/value': to_tensor_compat(stats.get('ppo/value_loss', 0.0)),
-            
-            # Old policy statistics key names - 修正逻辑
-            'ppo/policy/advantages_mean': to_tensor_compat(stats['ppo/advantages_mean']),
-            'ppo/returns/mean': to_tensor_compat(stats['ppo/returns_mean']),
-            'ppo/val/mean': to_tensor_compat(stats.get('ppo/values_mean', 0.0)),
-            'ppo/ratio_mean': to_tensor_compat(stats.get('ppo/ratio_mean', 0.0)),
-        }
-        
-        # Merge backward compatible statistics
-        stats.update(backward_compat_stats)
-        
-        # Calculate explained variance
         if 'returns_var' in train_stats and train_stats['returns_var'] > 0:
             explained_var = 1 - train_stats['value_loss'] / train_stats['returns_var']
             explained_var_value = explained_var.item() if hasattr(explained_var, 'item') else explained_var
             stats['ppo/explained_variance'] = explained_var_value
-            # Use inline conversion to ensure backward compatibility
             stats['ppo/val/var_explained'] = torch.tensor(float(explained_var_value))
         
+        # Finalization
         timing['total'] = time.time() - t0
         stats['time/ppo/total'] = timing['total']
         
-        # Clean up GPU cache
+        # EOS advantage metrics
+        for key in ['debug/advantage_at_eos_before_whiten', 'debug/advantage_at_eos_after_whiten', 'debug/advantage_at_eos_compression_ratio']:
+            if key in train_stats:
+                stats[key] = train_stats[key]
+        
         torch.cuda.empty_cache()
-        
-        # 🔧 New: 检查是否刚好完成critic预热阶段
-        if (self.step_count == self.config.critic_warmup_steps - 1 and 
-            self.config.critic_warmup_steps > 0):
-            self.logger.info(f"🎯 Critic warmup completed! Starting joint actor-critic training from step {self.step_count + 1}")
-        
         self.step_count += 1
         return stats
 
-    def save_checkpoint(self, path: str) -> None:
-        """Save training checkpoint"""
-        checkpoint = {
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
-            'kl_controller_value': self.kl_controller.value,
-            'step_count': self.step_count,
-            'config': self.config
-        }
-        torch.save(checkpoint, path)
-        self.logger.info(f"Checkpoint saved to: {path}")
-
-    def load_checkpoint(self, path: str) -> None:
-        """Load training checkpoint"""
-        checkpoint = torch.load(path, map_location=self.config.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        self.kl_controller.value = checkpoint['kl_controller_value']
-        self.step_count = checkpoint['step_count']
-        self.logger.info(f"Checkpoint loaded from {path}")
 
 
 # Backward compatible alias
 PPOTrainer = PPOCoderTrainer
 
 
-def create_ppocoder_trainer(
-    model, 
-    ref_model, 
-    learning_rate: float = 1e-5,
-    init_kl_coef: float = 0.1,
-    kl_target: float = 1.0,
-    **kwargs
-) -> PPOCoderTrainer:
-    """
-    Create PPOCoder trainer convenience function
-    
-    Args:
-        model: Training model
-        ref_model: Reference model
-        learning_rate: Learning rate
-        init_kl_coef: Initial KL coefficient
-        kl_target: KL target value
-        **kwargs: Other configuration parameters
-        
-    Returns:
-        PPOCoderTrainer instance
-    """
-    config = PPOConfig(
-        lr=learning_rate,
-        init_kl_coef=init_kl_coef,
-        kl_target=kl_target,
-        **kwargs
-    )
-    
+def create_ppocoder_trainer(model, ref_model, learning_rate: float = 1e-5, init_kl_coef: float = 0.1, kl_target: float = 1.0, **kwargs) -> PPOCoderTrainer:
+    """Create PPOCoder trainer"""
+    config = PPOConfig(lr=learning_rate, init_kl_coef=init_kl_coef, kl_target=kl_target, **kwargs)
     return PPOCoderTrainer(model, ref_model, config)

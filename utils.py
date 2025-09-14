@@ -1,6 +1,7 @@
 
 __all__ = ['extract_structure','flatten_dict', 'stack_dicts', 'add_suffix', 'pad_to_size', 'logprobs_from_logits', 'whiten',
-           'clip_by_value', 'entropy_from_logits', 'average_torch_dicts', 'stats_to_np', 'build_bert_batch_from_txt']
+           'clip_by_value', 'entropy_from_logits', 'average_torch_dicts', 'stats_to_np', 'build_bert_batch_from_txt',
+           'extract_code_from_qwen_response', 'read_qwen_examples', 'convert_qwen_examples_to_features', 'create_reward_wrapper']
 
 # Cell
 import torch
@@ -410,4 +411,195 @@ def build_bert_batch_from_txt(text_list, tokenizer, device):
     attention_masks = torch.cat(attention_masks)
 
     return padded_tensors, attention_masks
+
+
+# ========================================
+# Qwen Data Processing Functions
+# ========================================
+
+def extract_code_from_qwen_response(response: str, target_lang: str = "cpp") -> str:
+    """Extract code from Qwen response"""
+    import re
+    
+    # Language pattern mapping
+    lang_patterns = {
+        'cpp': ['cpp', 'c++', 'cxx'], 'java': ['java'], 'python': ['python', 'py'], 
+        'javascript': ['javascript', 'js'], 'c': ['c'], 'php': ['php'], 'c_sharp': ['csharp', 'c#', 'cs']
+    }
+    
+    # Try matching specific language code block (full match)
+    for pattern in lang_patterns.get(target_lang, [target_lang]):
+        escaped_pattern = re.escape(pattern)
+        code_match = re.search(rf'```{escaped_pattern}\s*(.*?)```', response, re.DOTALL | re.IGNORECASE)
+        if code_match:
+            return code_match.group(1).strip().lstrip('\n')
+    
+    # Try matching incomplete code block (only start marker)
+    for pattern in lang_patterns.get(target_lang, [target_lang]):
+        escaped_pattern = re.escape(pattern)
+        # Match ```python start, but no end marker
+        incomplete_match = re.search(rf'```{escaped_pattern}\s*(.*)', response, re.DOTALL | re.IGNORECASE)
+        if incomplete_match:
+            extracted = incomplete_match.group(1).strip().lstrip('\n')
+            # Remove possible end markdown marker
+            extracted = re.sub(r'```\s*$', '', extracted)
+            return extracted
+    
+    # General code block matching (full)
+    code_match = re.search(r'```\s*(.*?)```', response, re.DOTALL)
+    if code_match:
+        return code_match.group(1).strip().lstrip('\n')
+    
+    # General code block matching (incomplete)
+    incomplete_match = re.search(r'```\s*(.*)', response, re.DOTALL)
+    if incomplete_match:
+        extracted = incomplete_match.group(1).strip().lstrip('\n')
+        extracted = re.sub(r'```\s*$', '', extracted)
+        return extracted
+    
+    # translation: marker matching
+    translation_match = re.search(r'translation:\s*\n\n(.+)', response, re.DOTALL | re.IGNORECASE)
+    if translation_match:
+        return translation_match.group(1).strip()
+    
+    # Remove common prefixes
+    prefixes = ["Here's the C++ translation:", "Here's the Java translation:", "Here's the translation:", 
+               "Translation:", "```cpp", "```c++", "```java", "```python", "```"]
+    
+    for prefix in prefixes:
+        if response.startswith(prefix):
+            response = response[len(prefix):].strip()
+    
+    # Remove end marker and markdown line
+    response = response.rstrip("```").strip()
+    lines = [line for line in response.split('\n') 
+             if line.strip() not in ['```cpp', '```c++', '```java', '```python', '```javascript', '```c', '```php', '```csharp', '```']]
+    
+    return '\n'.join(lines).strip()
+
+
+def read_qwen_examples(filename: str, args) -> list:
+    """Read Qwen format JSONL file"""
+    import json
+    
+    examples = []
+    with open(filename, 'r', encoding='utf-8') as f:
+        for idx, line in enumerate(f):
+            if not line.strip():
+                continue
+            try:
+                data = json.loads(line)
+                messages = {msg.get('role'): msg.get('content', '') for msg in data.get('messages', [])}
+                
+                user_msg, assistant_msg = messages.get('user'), messages.get('assistant')
+                if not user_msg or not assistant_msg:
+                    continue
+                
+                source_code = extract_code_from_qwen_response(user_msg, args.source_lang)
+                target_code = extract_code_from_qwen_response(assistant_msg, args.target_lang)
+                
+                if source_code and target_code:
+                    e = Example(idx=idx, source=source_code, target=target_code, 
+                               source_orig=user_msg, target_orig=assistant_msg)
+                    setattr(e, "system_orig", messages.get('system', ''))
+                    examples.append(e)
+            except (json.JSONDecodeError, KeyError, IndexError) as e:
+                print(f"Skipping line {idx+1}, parsing error: {e}")
+    return examples
+
+
+def convert_qwen_examples_to_features(examples, tokenizer, args, stage=None):
+    """Convert Qwen samples to model input features"""
+    features = []
+    default_system = "You are a helpful assistant for code translation. You specialize in translating Java code to C++ code while maintaining functionality and best practices."
+        
+    for example_index, example in enumerate(examples):
+        # Apply chat template
+        if hasattr(tokenizer, 'apply_chat_template'):
+            try:
+                system_content = getattr(example, "system_orig", "") or default_system
+                messages = [
+                    {"role": "system", "content": system_content},
+                    {"role": "user", "content": example.source_orig}
+                ]
+                source_text = tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
+            except Exception as e:
+                print(f"❌ apply_chat_template failed: {e}")
+                source_text = example.source_orig
+        else:
+            source_text = example.source_orig
+            
+        # Encode source text and target text
+        source_ids = tokenizer.encode(source_text, max_length=args.max_source_length, truncation=True, add_special_tokens=True)
+        target_text = "None" if stage == "test" else example.target_orig
+        target_ids = tokenizer.encode(target_text, max_length=args.max_target_length, truncation=True, add_special_tokens=True)
+        
+        # Left padding
+        def pad_left(ids, max_length):
+            mask = [1] * len(ids)
+            padding = max_length - len(ids)
+            return [tokenizer.pad_token_id] * padding + ids, [0] * padding + mask
+        
+        source_ids, source_mask = pad_left(source_ids, args.max_source_length)
+        target_ids, target_mask = pad_left(target_ids, args.max_target_length)
+        
+        features.append(InputFeatures(example_index, source_ids, target_ids, source_mask, target_mask, example.target_orig))
+    return features
+
+
+def create_reward_wrapper(original_get_reward):
+    """Wrap reward function, handle code extraction and re-encoding"""
+    def get_reward_with_extraction(lang, code_ids=None, code_ref_ids=None, gold_ids=None, tokenizer=None):
+        def _decode_rows(t):
+            import torch
+            arr = t.detach().cpu().numpy()
+            eos_id = tokenizer.eos_token_id
+            texts = []
+            for row in arr:
+                eos_pos = int((row == eos_id).argmax()) if eos_id in row else len(row)
+                texts.append(tokenizer.decode(row[:eos_pos], skip_special_tokens=True, clean_up_tokenization_spaces=False))
+            return texts
+
+        # Decode original response and extract code
+        raw_responses = _decode_rows(code_ids)
+        raw_gold = _decode_rows(gold_ids)
+
+        extracted_codes = [extract_code_from_qwen_response(txt, lang) for txt in raw_responses]
+        extracted_codes_gold = [extract_code_from_qwen_response(txt, lang) for txt in raw_gold]
+
+        # Handle reference code (may be None, e.g. in GRPO)
+        if code_ref_ids is not None:
+            raw_responses_ref = _decode_rows(code_ref_ids)
+            extracted_codes_ref = [extract_code_from_qwen_response(txt, lang) for txt in raw_responses_ref]
+        else:
+            # If there is no reference code, use empty string as placeholder
+            extracted_codes_ref = [""] * len(extracted_codes)
+
+        # Re-encode and pad
+        import torch
+        eos_id, pad_id = tokenizer.eos_token_id, tokenizer.pad_token_id
+        triplets = [(tokenizer.encode(c, add_special_tokens=False) + [eos_id],
+                    tokenizer.encode(r, add_special_tokens=False) + [eos_id],
+                    tokenizer.encode(g, add_special_tokens=False) + [eos_id])
+                   for c, r, g in zip(extracted_codes, extracted_codes_ref, extracted_codes_gold)]
+
+        max_len = max(len(x) for tri in triplets for x in tri) if triplets else 1
+        _pad = lambda seq: seq + [pad_id] * (max_len - len(seq))
+
+        policy_padded = [_pad(x[0]) for x in triplets]
+        ref_padded = [_pad(x[1]) for x in triplets]
+        gold_padded = [_pad(x[2]) for x in triplets]
+
+        # Convert to tensor and call original reward function
+        # Get device information (use code_ids device if code_ref_ids is None)
+        device = code_ids.device if code_ids is not None else gold_ids.device
+        
+        return original_get_reward(
+            lang=lang,
+            code_ids=torch.tensor(policy_padded, dtype=torch.long, device=device),
+            code_ref_ids=torch.tensor(ref_padded, dtype=torch.long, device=device),
+            gold_ids=torch.tensor(gold_padded, dtype=torch.long, device=device),
+            tokenizer=tokenizer,
+        )
+    return get_reward_with_extraction
 

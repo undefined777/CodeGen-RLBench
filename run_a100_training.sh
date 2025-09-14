@@ -5,30 +5,31 @@ set -e  # Exit on error
 
 
 # 📁 Path configuration - Please modify according to actual situation
-MODEL_PATH="/home/cxy/Qwen2.5-Coder/finetuning/sft/checkpoints/qwen0.5b-lr5e-5-wr10-wd0.0-bsz1024-maxlen1280"
+MODEL_PATH="/home/cxy/CodeGen-RLBench/baseline_model/checkpoint-200"
 DATA_PATH="data"
 OUTPUT_PATH="./outputs"
 TENSORBOARD_DIR="${OUTPUT_PATH}/tensorboard"
 
 # 🎛️ A100 optimization training parameters
 SOURCE_LANG="java"
-TARGET_LANG="cpp"
+TARGET_LANG="python"
+RL_ALGORITHM="grpo"       # Choose reinforcement learning algorithm: "ppo" or "grpo"
+GROUP_SIZE=4              # GRPO algorithm's group size
 TRAIN_BATCH_SIZE=8        # A100 can support larger batch size
 TEST_BATCH_SIZE=1         # Test with larger batch
 MAX_SOURCE_LENGTH=700      # Increase sequence length
 MAX_TARGET_LENGTH=700
-LEARNING_RATE=5e-6        # 降低学习率，避免梯度爆炸
+LEARNING_RATE=5e-6        # Decrease learning rate to avoid gradient explosion
 TRAIN_EPOCHS=10       # Large number of training epochs
-KL_COEF=0.1               # 增加KL系数，加强参考模型约束
+KL_COEF=0.1               # Increase KL coefficient, strengthen reference model constraint
 VF_COEF=1e-3              # Value function coefficient
 SAVE_EVERY_N_STEPS=100    # Save every 100 training steps
 MAX_CHECKPOINTS=20        # A100 has large storage, can retain more checkpoints
-MINIBATCH_SIZE=1          # 保持为1，通过梯度累积模拟更大batch
-GRADIENT_ACCUMULATION_STEPS=4  # 4步累积 = 有效batch为16/4=4次更新
-CRITIC_WARMUP_STEPS=50    # Critic预热步数，让价值网络先稳定
+MINIBATCH_SIZE=1          # Keep as 1, simulate larger batch through gradient accumulation
+GRADIENT_ACCUMULATION_STEPS=4  # 4 steps accumulation = effective batch is 16/4=4 updates
 
 # 🔍 Create output directory
-echo "📁 创建输出目录: ${OUTPUT_PATH}"
+echo "📁 Create output directory: ${OUTPUT_PATH}"
 mkdir -p "${OUTPUT_PATH}"
 mkdir -p "${TENSORBOARD_DIR}"
 
@@ -47,6 +48,8 @@ Model configuration:
 - Model path: ${MODEL_PATH}
 - Source language: ${SOURCE_LANG}
 - Target language: ${TARGET_LANG}
+- RL algorithm: ${RL_ALGORITHM}
+- Group size: ${GROUP_SIZE}
 
 Training parameters:
 - Training batch size: ${TRAIN_BATCH_SIZE}
@@ -59,7 +62,6 @@ Training parameters:
 - Value function coefficient: ${VF_COEF}
 - Minibatch size: ${MINIBATCH_SIZE}
 - Gradient accumulation steps: ${GRADIENT_ACCUMULATION_STEPS}
-- Critic warmup steps: ${CRITIC_WARMUP_STEPS}
 - Save interval: ${SAVE_EVERY_N_STEPS} training steps
 - Maximum checkpoints: ${MAX_CHECKPOINTS}
 
@@ -83,12 +85,14 @@ echo "📈 Tensorboard monitoring: tensorboard --logdir=${TENSORBOARD_DIR} --por
 echo ""
 
 # Use nohup to run in the background, redirect output to log file
-python optimized_rl_trainer.py \
+python rl_trainer.py \
   --source_lang "${SOURCE_LANG}" \
   --target_lang "${TARGET_LANG}" \
   --model_path "${MODEL_PATH}" \
   --data_path "${DATA_PATH}" \
   --output_path "${OUTPUT_PATH}" \
+  --rl_algorithm "${RL_ALGORITHM}" \
+  --group_size ${GROUP_SIZE} \
   --max_source_length ${MAX_SOURCE_LENGTH} \
   --max_target_length ${MAX_TARGET_LENGTH} \
   --train_batch_size ${TRAIN_BATCH_SIZE} \
@@ -100,9 +104,6 @@ python optimized_rl_trainer.py \
   --save_every_n_steps ${SAVE_EVERY_N_STEPS} \
   --minibatch_size ${MINIBATCH_SIZE} \
   --gradient_accumulation_steps ${GRADIENT_ACCUMULATION_STEPS} \
-  --critic_warmup_steps ${CRITIC_WARMUP_STEPS} \
   --max_checkpoints ${MAX_CHECKPOINTS} \
   --use_tensorboard \
-  --tensorboard_log_dir "${TENSORBOARD_DIR}" \
-  --log_every_n_steps 1 \
   --seed 44
